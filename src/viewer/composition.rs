@@ -6,8 +6,8 @@ use crate::storage::Storage;
 use crate::widgets::{
     BranchTimeline, ColonyViewer, DecisionsPanel, DiagnosticsViewer, DiscordViewer, EventsViewer,
     FilesViewer, GameWrite, GoalsBoard, KnowledgeHealthViewer, KnowledgeViewer, MailViewer,
-    MemoryViewer, MessagesPanel, PriorityGame, ProfilesViewer, RelationsViewer, SchemasViewer,
-    SourceKey, StorageState, TeamsViewer, TimelineSource, WidgetContext,
+    MemoryViewer, MessagesPanel, PriorityGame, ProfilesViewer, RelationsViewer, RulesViewer,
+    SchemasViewer, SourceKey, StorageState, TeamsViewer, TimelineSource, WidgetContext,
 };
 use std::sync::Arc;
 use triblespace::prelude::Id;
@@ -19,7 +19,7 @@ impl Target {
         match self {
             Self::Dashboard => &SourceKey::ALL,
             Self::Schemas => &[SourceKey::Schemas],
-            Self::Colony => &crate::widgets::colony::INPUTS,
+            Self::Colony => &crate::widgets::colony::SOURCES,
             Self::Discord => &[SourceKey::Discord],
             Self::Files => &[SourceKey::Files],
             Self::KnowledgeHealth => &[SourceKey::Knowledge],
@@ -29,6 +29,7 @@ impl Target {
             Self::Events => &[SourceKey::Events],
             Self::Teams => &[SourceKey::Teams],
             Self::Diagnostics => &[SourceKey::Diagnostics],
+            Self::Rules => &crate::widgets::rules::INPUTS,
         }
     }
 }
@@ -238,6 +239,18 @@ pub fn compose_hosted(nb: &mut NotebookCtx, target: Target, host: impl Host) {
             host.clone(),
             "colony",
             ColonyViewer::default,
+            |ctx, panel, sources, _| {
+                panel.render(ctx, sources);
+            },
+        );
+    }
+
+    if target == Target::Dashboard || target == Target::Rules {
+        card(
+            nb,
+            host.clone(),
+            "rules",
+            RulesViewer::default,
             |ctx, panel, sources, _| {
                 panel.render(ctx, sources);
             },
@@ -644,6 +657,8 @@ mod tests {
     #[test]
     fn focused_inputs_keep_the_original_roots_and_storage_owns_dependencies() {
         assert_eq!(Target::Dashboard.sources(), &SourceKey::ALL);
+        assert_eq!(Target::Colony.sources(), &crate::widgets::colony::SOURCES);
+        assert_eq!(Target::Rules.sources(), &crate::widgets::rules::INPUTS);
         for (target, source) in [
             (Target::Schemas, SourceKey::Schemas),
             (Target::Discord, SourceKey::Discord),

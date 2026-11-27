@@ -247,6 +247,7 @@ fn validate_persona(persona: &str) -> Result<()> {
 
 #[path = "conversation.rs"]
 mod conversation;
+pub(crate) use conversation::{conversation_nodes, order_nodes};
 
 #[cfg(test)]
 use crate::storage::FactView;

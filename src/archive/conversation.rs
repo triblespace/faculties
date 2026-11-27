@@ -207,3 +207,77 @@ fn zooid_leaf(facts: &FactArchive, locator: &Locator) -> Result<(Id, String)> {
     }
     Ok((node, line))
 }
+
+/// Every node of the conversation `session/<id>` or `thread/<id>` names:
+/// the ancestry of every leaf its receipts carry, so a conversation that
+/// branched keeps every observed branch. Returns the leaves nothing follows
+/// and the nodes, roots first: every node after all of its parents, ties by
+/// id, which across branches is a deterministic order, not chronology.
+/// `None` when no receipt carries the locator, or it is neither form.
+/// Nothing is cut: the caller pages what it shows.
+pub(crate) fn conversation_nodes(
+    facts: &FactArchive,
+    locator: &str,
+) -> Result<Option<(Vec<Id>, Vec<Id>)>> {
+    let locator = match Locator::parse(locator) {
+        Some(Locator::Zooid(_)) | None => return Ok(None),
+        Some(locator) => locator,
+    };
+    let starts: BTreeSet<Id> = selected_receipts(facts, &locator)
+        .into_iter()
+        .map(|(_, node)| node)
+        .collect();
+    if starts.is_empty() {
+        return Ok(None);
+    }
+    let nodes = ancestry_in_order(facts, starts.iter().copied())?;
+    let tips = starts
+        .into_iter()
+        .filter(|node| {
+            !exists!(pattern!(facts, [{
+                _?next @ archive_schema::block::previous: *node
+            }]))
+        })
+        .collect();
+    Ok(Some((tips, nodes)))
+}
+
+/// `starts` and every node reached back from them along `previous`, roots
+/// first ([`super::reading_order`]).
+pub(crate) fn ancestry_in_order(
+    facts: &FactArchive,
+    starts: impl IntoIterator<Item = Id>,
+) -> Result<Vec<Id>> {
+    let mut pending: BTreeSet<Id> = starts.into_iter().collect();
+    let mut parents = BTreeMap::<Id, BTreeSet<Id>>::new();
+    while let Some(node) = pending.pop_first() {
+        if parents.contains_key(&node) {
+            continue;
+        }
+        let previous: BTreeSet<Id> = find!(
+            previous: Id,
+            pattern!(facts, [{ node @ archive_schema::block::previous: ?previous }])
+        )
+        .collect();
+        pending.extend(previous.iter().copied());
+        parents.insert(node, previous);
+    }
+    super::reading_order(&parents)
+}
+
+/// `nodes` alone, roots first: each after those of its parents among them
+/// ([`super::reading_order`]); a parent outside `nodes` is not walked.
+pub(crate) fn order_nodes(facts: &FactArchive, nodes: &BTreeSet<Id>) -> Result<Vec<Id>> {
+    let parents: BTreeMap<Id, BTreeSet<Id>> = nodes
+        .iter()
+        .map(|&node| {
+            let previous = find!(
+                previous: Id,
+                pattern!(facts, [{ node @ archive_schema::block::previous: ?previous }])
+            )
+            .collect();
+            (node, previous)
+        })
+        .collect();
+    super::reading_order(&parents)
+}

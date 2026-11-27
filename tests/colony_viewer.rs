@@ -22,6 +22,26 @@ use triblespace::core::repo::{SnapshotSource, StoreChanges, StoreSnapshot};
 use triblespace::prelude::*;
 use GORBIE::prelude::CardCtx;
 
+/// A prepared opening input larger than a page, Agy's 933,083 bytes.
+fn huge_prompt() -> String {
+    let mut prompt = "wake text ".repeat(93_305);
+    prompt.push_str("# Brief\nCheck the second synthetic track.");
+    assert!(prompt.len() >= 933_083);
+    prompt
+}
+
+/// A Claude Code session: the opening input, a call, its result, a reply.
+fn claude_session(id: &str, opening: &str) -> String {
+    let opening = serde_json::to_string(opening).unwrap();
+    format!(
+        r#"{{"type":"user","sessionId":"{id}","uuid":"u1","parentUuid":null,"timestamp":"2026-11-18T08:04:01Z","message":{{"role":"user","content":{opening}}}}}
+{{"type":"assistant","sessionId":"{id}","uuid":"a1","parentUuid":"u1","timestamp":"2026-11-18T08:04:02Z","message":{{"role":"assistant","model":"claude-fixture","content":[{{"type":"text","text":"Listening to {id} first."}},{{"type":"tool_use","id":"toolu_1","name":"Bash","input":{{"command":"ls tracks"}}}}]}}}}
+{{"type":"user","sessionId":"{id}","uuid":"u2","parentUuid":"a1","timestamp":"2026-11-18T08:04:03Z","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"toolu_1","content":[{{"type":"text","text":"track-two.wav"}}]}}]}}}}
+{{"type":"assistant","sessionId":"{id}","uuid":"a2","parentUuid":"u2","timestamp":"2026-11-18T08:04:05Z","message":{{"role":"assistant","model":"claude-fixture","content":[{{"type":"text","text":"Track two of {id} is there."}}]}}}}
+"#
+    )
+}
+
 struct Fixture {
     _file: tempfile::NamedTempFile,
     pile: Pile,
@@ -49,7 +69,9 @@ impl Fixture {
         let goals = collection("Goals fixture");
         let messages = collection("Messages fixture");
         let people = collection("People fixture");
+        let history = collection("Archive fixture");
         let routes = CollectionRoutes::from([
+            (schemas::blockdag::DEFAULT_SCOPE_ID, history.handle()),
             (schemas::spawn::DEFAULT_SCOPE_ID, runs.handle()),
             (schemas::compass::DEFAULT_SCOPE_ID, goals.handle()),
             (schemas::message::DEFAULT_SCOPE_ID, messages.handle()),
@@ -105,6 +127,7 @@ impl Fixture {
 
         let mut workers = Fragment::empty();
         let mut mail = Fragment::empty();
+        let mut archived = Fragment::empty();
         let mut names = vec![];
         for (index, (brief, persona)) in [
             ("Inspect the first synthetic track", child_id),
@@ -124,7 +147,11 @@ impl Fixture {
                 unit: format!("fixture-{index}.service"),
                 workdir: "/fixture".into(),
                 effort: "medium".into(),
-                prompt: brief.into(),
+                prompt: if index == 1 {
+                    huge_prompt()
+                } else {
+                    brief.into()
+                },
                 wake: None,
                 provider: "fixture".into(),
                 provider_reason: "testing".into(),
@@ -136,6 +163,26 @@ impl Fixture {
                 resident: false,
             });
             workers += start;
+            // Each run names its own provider conversation, archived here.
+            let session = format!("fixture-{index}");
+            let locator = workers.put::<blobencodings::UTF8String, _>(format!("session/{session}"));
+            workers += entity! { ExclusiveId::force_ref(&run) @
+                schemas::blockdag::source_projection::source_locator: locator,
+            };
+            let received = if index == 1 {
+                format!("{}<truncated 741501 bytes>", &huge_prompt()[..191_985])
+            } else {
+                brief.to_owned()
+            };
+            faculties::archive_claude_code::project_bytes(
+                "/fixture/session.jsonl",
+                anybytes::Bytes::from_source(claude_session(&session, &received).into_bytes()),
+                |projected| {
+                    archived += projected.fragment;
+                    Ok(())
+                },
+            )
+            .unwrap();
             if index == 1 {
                 workers += spawn::settlement_fragment(
                     run,
@@ -204,6 +251,7 @@ impl Fixture {
         pile.commit(people, &signer, roster).unwrap();
         pile.commit(messages, &signer, mail).unwrap();
         pile.commit(runs, &signer, workers).unwrap();
+        pile.commit(history, &signer, archived).unwrap();
         let blob: Blob<blobencodings::UTF8String> = "Inspect the rehearsal audio".to_blob();
         let title_hash = blob.get_handle().raw;
         Self {
@@ -511,5 +559,390 @@ fn export_colony_fixture() {
         )
         .unwrap();
     assert!(pages > 0);
+    fixture.pile.close().unwrap();
+}
+
+/// Only the latest synthetic frame, printed on failure, never a history cache.
+#[derive(Default)]
+struct FrameDiagnostics(RefCell<Vec<String>>);
+
+impl Drop for FrameDiagnostics {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            use std::io::Write;
+            let mut stderr = std::io::stderr().lock();
+            let _ = writeln!(stderr, "Latest frame geometry (at most 256 text shapes):");
+            for line in self.0.get_mut().iter() {
+                let _ = writeln!(stderr, "{line}");
+            }
+        }
+    }
+}
+
+/// Text shapes with a visible intersection, and a visible interaction anchor.
+/// Galley text is layout content, not proof that every glyph is on screen.
+fn shape_texts(
+    shape: &Shape,
+    clip: egui::Rect,
+    result: &mut Vec<(String, egui::Rect)>,
+    geometry: &mut Vec<String>,
+) {
+    match shape {
+        Shape::Text(t) => {
+            let rect = t.galley.rect.translate(t.pos.to_vec2());
+            let visible = rect.intersect(clip);
+            if geometry.len() <= 256 {
+                let label: String = t.galley.text().chars().take(96).collect();
+                geometry.push(format!(
+                    "{label:?}: rect={rect:?}, clip={clip:?}, visible={visible:?}"
+                ));
+            }
+            if visible.is_positive() {
+                result.push((t.galley.text().to_owned(), visible));
+            }
+        }
+        Shape::Vec(v) => v.iter().for_each(|shape| shape_texts(shape, clip, result, geometry)),
+        _ => {}
+    }
+}
+
+#[test]
+fn an_opened_run_shows_its_prepared_input_and_its_own_turns_on_demand() {
+    let mut fixture = Fixture::new();
+    let (observation, tracker) = fixture.observe(1);
+    let host = FixtureHost {
+        observation: Rc::new(RefCell::new(observation)),
+        open: Rc::new(Cell::new(true)),
+    };
+    let ctx = egui::Context::default();
+    let nb_host = host.clone();
+    // Exercise the normal Data composition, alongside the Rules card.
+    // Other tests below retain the dedicated Colony target coverage.
+    let mut notebook = GORBIE::NotebookConfig::new("Data")
+        .without_editor()
+        .embedded(&ctx, move |nb| {
+            compose_hosted(nb, Target::Dashboard, nb_host.clone())
+        });
+    // embedded installs its themes: set this afterwards so it remains effective.
+    // This checks content and real clicks, not decorative expansion timing.
+    // Keep native background reads/waits; remove only animated clipping.
+    ctx.global_style_mut(|style| style.animation_time = 0.0);
+    assert_eq!(ctx.global_style().animation_time, 0.0);
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 20_000.0));
+    let geometry = FrameDiagnostics::default();
+    let mut events = Vec::new();
+    let mut frame = |events: Vec<egui::Event>| {
+        let input = egui::RawInput {
+            screen_rect: Some(screen),
+            events,
+            ..Default::default()
+        };
+        let output = ctx.run_ui(input, |ui| notebook.show(ui, None));
+        let mut texts = vec![];
+        let mut geometry = geometry.0.borrow_mut();
+        geometry.clear();
+        geometry.push(format!("viewport={screen:?}"));
+        for shape in output.shapes {
+            shape_texts(&shape.shape, shape.clip_rect, &mut texts, &mut geometry);
+        }
+        texts
+    };
+    let joined = |texts: &[(String, egui::Rect)]| {
+        texts
+            .iter()
+            .map(|(text, _)| text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    // Wait until `wanted` is drawn; returns the frame's texts.
+    let mut wait = |frame: &mut dyn FnMut(Vec<egui::Event>) -> Vec<(String, egui::Rect)>,
+                    events: &mut Vec<egui::Event>,
+                    wanted: &str| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let texts = frame(std::mem::take(events));
+            if texts.iter().any(|(text, _)| text.contains(wanted)) {
+                return texts;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "missing {wanted:?} in {}",
+                joined(&texts)
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    // Click the `nth` drawn text equal to `label`.
+    let click = |texts: &[(String, egui::Rect)], label: &str, nth: usize| {
+        let (_, rect) = texts
+            .iter()
+            .filter(|(text, _)| text == label)
+            .nth(nth)
+            .unwrap_or_else(|| panic!("no {label:?} #{nth} in {}", joined(texts)));
+        let pos = rect.center();
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            },
+        ]
+    };
+
+    // Other Dashboard cards can show the child before Colony's async result.
+    // Wait for the actual Colony control that the next interaction needs.
+    let texts = wait(&mut frame, &mut events, "What it lived");
+    let overview = joined(&texts);
+    assert!(overview.contains(&fixture.child));
+    for absent in [
+        "Listening to fixture",
+        "wake text wake",
+        "Prepared opening input",
+    ] {
+        assert!(
+            !overview.contains(absent),
+            "a closed run reads nothing: {absent}"
+        );
+    }
+    let huge: Blob<blobencodings::UTF8String> = huge_prompt().to_blob();
+    let huge = huge.get_handle().raw;
+    let fetched = |tracker: &DependencyTracker| {
+        tracker
+            .lock()
+            .unwrap()
+            .blobs
+            .iter()
+            .any(|hash| hash.raw == huge)
+    };
+    assert!(
+        !fetched(&tracker),
+        "the overview never loads a prepared input"
+    );
+
+    // The open run (fixture-0) lists first under its spawner.
+    events = click(&texts, "What it lived", 0);
+    // The page count appears before the asynchronous turn bodies arrive.
+    let texts = wait(&mut frame, &mut events, "End of the archived history.");
+    let lived = joined(&texts);
+    for expected in [
+        "The archived history of session/fixture-0, the conversation this run names.",
+        "No other run here names it; that is what is observed, not proof that it holds only this run's life.",
+        "Turns 1–",
+        "Received",
+        "Produced",
+        "Listening to fixture-0 first.",
+        "track-two.wav",
+        "answers call #",
+        "answered by #",
+        "Track two of fixture-0 is there.",
+        "End of the archived history.",
+    ] {
+        assert!(lived.contains(expected), "missing {expected:?} in {lived}");
+    }
+    assert!(
+        !lived.contains("fixture-1 first"),
+        "another run's conversation stays out of this one"
+    );
+    let call = lived.find("tool-call").unwrap();
+    let result = lived.find("tool-result").unwrap();
+    assert!(call < result, "causal order: the call before its result");
+
+    // The ended run with the huge prompt: its input loads only when opened.
+    let texts = frame(Vec::new());
+    events = click(&texts, "What it lived", 1);
+    // The first run already has a prepared-input header; await this run.
+    let texts = wait(
+        &mut frame,
+        &mut events,
+        "The archived history of session/fixture-1,",
+    );
+    assert!(
+        !fetched(&tracker),
+        "a collapsed prepared input is not loaded"
+    );
+    events = click(&texts, "Prepared opening input", 1);
+    let texts = wait(&mut frame, &mut events, "of 933");
+    let opened = joined(&texts);
+    for expected in [
+        "no evidence that every byte reached the model",
+        "bytes 0–32768 of",
+        "page 1 of",
+        "End of the prepared opening input.",
+        "The first observed input payload differs from this prepared text",
+        "It does not establish the initial message or a whole-message match.",
+    ] {
+        assert!(
+            opened.contains(expected),
+            "missing {expected:?} in {opened}"
+        );
+    }
+    assert!(
+        !opened.contains("Check the second synthetic track."),
+        "only one page is drawn"
+    );
+    assert!(fetched(&tracker), "an opened prepared input is read whole");
+    // Paging to the end reaches the brief's last bytes.
+    let mut texts = texts;
+    for _ in 0..40 {
+        if joined(&texts).contains("Check the second synthetic track.") {
+            break;
+        }
+        let next = texts
+            .iter()
+            .filter(|(text, _)| text == "▶")
+            .next()
+            .expect("a next-page button")
+            .1;
+        let pos = next.center();
+        events = vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            },
+        ];
+        frame(std::mem::take(&mut events));
+        texts = frame(Vec::new());
+    }
+    assert!(joined(&texts).contains("Check the second synthetic track."));
+
+    // The received payload is separately paged. Close the prepared input so
+    // the remaining text pager belongs to the received payload, and wait for
+    // its turn bodies rather than the already-visible page count.
+    events = click(&texts, "Prepared opening input", 1);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut texts = loop {
+        let texts = frame(std::mem::take(&mut events));
+        let shown = joined(&texts);
+        if shown.contains("Listening to fixture-1 first.") && !shown.contains("of 933") {
+            break texts;
+        }
+        assert!(Instant::now() < deadline, "{shown}");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    const CUT_MARKER: &str = "<truncated 741501 bytes>";
+    assert!(
+        !joined(&texts).contains(CUT_MARKER),
+        "the received payload's first page does not contain its final marker"
+    );
+    // The fixture's received text needs twelve 16-KiB pages, not one eager
+    // body. Navigate the actual pager, preserving the end-marker assertion.
+    for _ in 0..16 {
+        if joined(&texts).contains(CUT_MARKER) {
+            break;
+        }
+        events = click(&texts, "▶", 0);
+        frame(std::mem::take(&mut events));
+        texts = frame(Vec::new());
+    }
+    assert!(joined(&texts).contains(CUT_MARKER));
+    fixture.pile.close().unwrap();
+}
+
+#[test]
+fn a_workspace_without_the_archive_route_says_so_and_still_shows_the_prepared_input() {
+    let mut fixture = Fixture::new();
+    fixture.routes.remove(&schemas::blockdag::DEFAULT_SCOPE_ID);
+    let (observation, _) = fixture.observe(1);
+    let context = observation.loaded_context();
+    assert!(!context.contains(faculties::widgets::SourceKey::Archive));
+    let host = FixtureHost {
+        observation: Rc::new(RefCell::new(observation)),
+        open: Rc::new(Cell::new(true)),
+    };
+    let ctx = egui::Context::default();
+    let nb_host = host.clone();
+    let mut notebook = GORBIE::NotebookConfig::new("Test dashboard")
+        .without_editor()
+        .embedded(&ctx, move |nb| {
+            compose_hosted(nb, Target::Colony, nb_host.clone())
+        });
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 20_000.0));
+    let geometry = FrameDiagnostics::default();
+    let mut frame = |events: Vec<egui::Event>| {
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            },
+            |ui| notebook.show(ui, None),
+        );
+        let mut texts = vec![];
+        let mut geometry = geometry.0.borrow_mut();
+        geometry.clear();
+        geometry.push(format!("viewport={screen:?}"));
+        for shape in output.shapes {
+            shape_texts(&shape.shape, shape.clip_rect, &mut texts, &mut geometry);
+        }
+        texts
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let texts = loop {
+        let texts = frame(Vec::new());
+        if texts.iter().any(|(text, _)| text == "What it lived") {
+            break texts;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let (_, rect) = texts
+        .iter()
+        .find(|(text, _)| text == "What it lived")
+        .unwrap();
+    let pos = rect.center();
+    let mut events = vec![
+        egui::Event::PointerMoved(pos),
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        },
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        },
+    ];
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let shown = loop {
+        let texts = frame(std::mem::take(&mut events));
+        let joined = texts
+            .iter()
+            .map(|(text, _)| text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        // The heading can paint before its reason during header expansion.
+        if joined.contains("Archive route missing from this workspace.") {
+            break joined;
+        }
+        assert!(Instant::now() < deadline, "{joined}");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert!(
+        shown.contains("Archive route missing from this workspace."),
+        "{shown}"
+    );
+    assert!(shown.contains("Archive history unavailable."), "{shown}");
+    assert!(shown.contains("Prepared opening input"), "{shown}");
+    assert!(!shown.contains("Listening to fixture"), "{shown}");
     fixture.pile.close().unwrap();
 }
