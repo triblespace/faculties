@@ -397,13 +397,17 @@ mod tests {
         // Missing child bytes leave explicit upkeep pending; a raw source
         // cannot become an ephemeral query result through an ordinary read.
         assert_eq!(
-            store
-                .ensure_attached_within_with::<ArchiveTextBm25Mapping>(
-                    target,
-                    &signer,
+            triblespace::core::collection::prepare_attached_with::<ArchiveTextBm25Mapping, _>(
+                &frozen,
+                target,
+                &signer,
+                triblespace::core::collection::AttachmentLimit::SourceBytes(
                     crate::archive_collection::SEARCH_BUILD_BUDGET,
-                )
-                .unwrap(),
+                ),
+            )
+            .unwrap()
+            .publish(&mut store, &signer)
+            .unwrap(),
             0
         );
         let pending = frozen
@@ -436,14 +440,17 @@ mod tests {
             .unwrap();
         assert_eq!(before.unread().len(), 1);
         assert_eq!(
-            store
-                .ensure_attached_within_reading::<ArchiveTextBm25Mapping, _>(
-                    target,
-                    &signer,
+            triblespace::core::collection::prepare_attached_with::<ArchiveTextBm25Mapping, _>(
+                &reader,
+                target,
+                &signer,
+                triblespace::core::collection::AttachmentLimit::SourceBytes(
                     crate::archive_collection::SEARCH_BUILD_BUDGET,
-                    &reader,
-                )
-                .unwrap(),
+                ),
+            )
+            .unwrap()
+            .publish(&mut store, &signer)
+            .unwrap(),
             1
         );
         // Query a new snapshot only after the writer has stored its image/MAP.

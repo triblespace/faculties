@@ -6570,14 +6570,16 @@ async fn wake_selection(
                     let prepared = tokio::task::spawn_blocking(move || {
                         let reader =
                             crate::storage::AcquiringReader::with_handle(selected, runtime);
-                        triblespace::core::collection::prepare_attached_within::<
+                        triblespace::core::collection::prepare_attached::<
                             triblespace_search::portable_bm25::PortableBM25Blob,
                             _,
                         >(
                             &reader,
                             target,
                             &writer,
-                            crate::archive_collection::SEARCH_BUILD_BUDGET,
+                            triblespace::core::collection::AttachmentLimit::SourceBytes(
+                                crate::archive_collection::SEARCH_BUILD_BUDGET,
+                            ),
                         )
                     })
                     .await

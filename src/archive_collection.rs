@@ -869,16 +869,17 @@ pub const SEARCH_BUILD_BUDGET: u64 = 16 << 20;
 /// arrival below does not reselect either of them. The surrounding operation
 /// owns the store.
 ///
-/// Each of the three passes maps residual Archive foundations, up to
-/// [`SEARCH_BUILD_BUDGET`] successful source bytes in residual order, with
-/// one initial oversized success allowed. Missing dependencies stay pending;
+/// Each of the three passes uses normal attachment upkeep with a
+/// [`SEARCH_BUILD_BUDGET`] successful-source-byte limit. Oversized existing
+/// merges are descended; one initial oversized leaf can succeed.
+/// Missing dependencies stay pending;
 /// attempts and dependency/output sizes are not bounded by that input budget.
 /// Images and host-signed MAPs are
 /// persisted before the query. The query uses only the resulting stored
-/// cover; what the budget leaves out is reported as lag. A search never
-/// maps a whole merge node: on 2026-10-26 a search that maintained first
-/// did, and grew to about 62 GB; `archive index` and maintenance carry and
-/// attach the merged frontier.
+/// cover; what the budget leaves out is reported as lag. This does not carry
+/// the source into a new merge, or force an oversized merged frontier through
+/// the mapper: on 2026-10-26 such a search grew to about 62 GB.
+/// `archive index` and background maintenance do full frontier upkeep.
 ///
 /// Keeping needs the store opened as the signing key, which every faculty
 /// store is; a key that is not the store's host publishes nothing, and the
@@ -919,34 +920,26 @@ pub(crate) fn search_views_within(
         let (succinct, rank9) = crate::storage::fact_pair(store, source)?;
         // BM25 hits join back to Archive facts. Publish both prerequisite
         // mappings explicitly; ordinary fact reads must never build them.
-        // Do not use frontier maintenance here: one merged Archive can be
-        // much larger than this foreground per-foundation budget.
-        let fact_reader = crate::storage::AcquiringReader::new(store.snapshot()?, runtime.clone());
-        crate::storage::tolerate_own_lag(
-            triblespace::core::collection::prepare_attached_within::<SuccinctArchiveBlob, _>(
-                &fact_reader, succinct, signer, budget,
+        // Use the existing upkeep traversal with an explicit input limit;
+        // never force a large merged frontier through the mapper.
+        let limit = triblespace::core::collection::AttachmentLimit::SourceBytes(budget);
+        runtime.block_on(async {
+            crate::storage::tolerate_own_lag(
+                store.ensure_attached_limited(succinct, signer, limit).await,
             )
-            .and_then(|prepared| prepared.publish(store, signer)),
-        )
-        .context("publish bounded Archive Succinct attachments")?;
-        // Rank9's dependency is the just-published same-foundation Succinct
-        // MAP, so it must plan from a fresh observation.
-        let fact_reader = crate::storage::AcquiringReader::new(store.snapshot()?, runtime.clone());
-        crate::storage::tolerate_own_lag(
-            triblespace::core::collection::prepare_attached_within::<
-                Rank9AcceleratedSuccinctArchiveBlob,
-                _,
-            >(&fact_reader, rank9, signer, budget)
-            .and_then(|prepared| prepared.publish(store, signer)),
-        )
-        .context("publish bounded Archive Rank9 attachments")?;
-        let upkeep_reader = crate::storage::AcquiringReader::new(store.snapshot()?, runtime.clone());
-        crate::storage::tolerate_own_lag(
-            store.ensure_attached_within_reading::<archive_bm25::ArchiveTextBm25Mapping, _>(
-                target, signer, budget, &upkeep_reader,
-            ),
-        )
-        .context("publish bounded Archive BM25 attachments")?;
+            .context("publish bounded Archive Succinct attachments")?;
+            // Normal upkeep selects afresh, seeing Succinct's published MAP.
+            crate::storage::tolerate_own_lag(
+                store.ensure_attached_limited(rank9, signer, limit).await,
+            )
+            .context("publish bounded Archive Rank9 attachments")?;
+            crate::storage::tolerate_own_lag(
+                store.ensure_attached_limited_with::<archive_bm25::ArchiveTextBm25Mapping>(
+                    target, signer, limit,
+                ).await,
+            )
+            .context("publish bounded Archive BM25 attachments")
+        })?;
         // Publication precedes this shared query watermark. No read builds.
         let after = crate::storage::AcquiringReader::new(store.snapshot()?, runtime.clone());
         let facts = after.attached_acquiring(rank9)?;
