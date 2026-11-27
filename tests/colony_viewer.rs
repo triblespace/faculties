@@ -607,6 +607,117 @@ fn shape_texts(
 }
 
 #[test]
+fn the_opening_renders_the_exact_prompt_without_reading_a_separate_wake() {
+    const PROMPT: &str = "PROMPT-ONLY: Read the named wake parts, then inspect the track.";
+    const WAKE: &str = "WAKE-ONLY: Separate retained context that is not the first input.";
+    let mut fixture = Fixture::new();
+    // Select a real Spawn collection holding just this run, so its controls
+    // cannot be confused with another run's prepared input.
+    let runs = fixture
+        .pile
+        .collection(
+            "Distinct prompt and wake fixture",
+            CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
+        )
+        .unwrap();
+    let (mut facts, spawn_id, _, _) = spawn::spawn_fragment("Separate prompt and wake").unwrap();
+    facts += spawn::run_fragment(&spawn::RunFacts {
+        spawn: spawn_id,
+        started_at: clock::point_now().unwrap(),
+        persona: genid().id,
+        spawner: fixture.spawner,
+        unit: "prompt-wake-fixture.service".into(),
+        workdir: "/fixture".into(),
+        effort: "medium".into(),
+        prompt: PROMPT.into(),
+        wake: Some(WAKE.into()),
+        provider: "agy".into(),
+        provider_reason: "synthetic first-input selection".into(),
+        model: None,
+        model_unset: None,
+        untinted: None,
+        resumes: None,
+        cover: None,
+        resident: true,
+    })
+    .0;
+    let route = runs.handle();
+    fixture.pile.commit(runs, &fixture.signer, facts).unwrap();
+    fixture.routes.insert(schemas::spawn::DEFAULT_SCOPE_ID, route);
+    let (observation, tracker) = fixture.observe(1);
+    let host = FixtureHost {
+        observation: Rc::new(RefCell::new(observation)),
+        open: Rc::new(Cell::new(true)),
+    };
+    let ctx = egui::Context::default();
+    let mut notebook = GORBIE::NotebookConfig::new("Prompt and wake")
+        .without_editor()
+        .embedded(&ctx, move |nb| compose_hosted(nb, Target::Colony, host.clone()));
+    ctx.global_style_mut(|style| style.animation_time = 0.0);
+    let geometry = FrameDiagnostics::default();
+    let mut frame = |events: Vec<egui::Event>| {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 2000.0));
+        let output = ctx.run_ui(
+            egui::RawInput { screen_rect: Some(screen), events, ..Default::default() },
+            |ui| notebook.show(ui, None),
+        );
+        let mut texts = Vec::new();
+        let mut geometry = geometry.0.borrow_mut();
+        geometry.clear();
+        geometry.push(format!("viewport={screen:?}"));
+        for shape in output.shapes {
+            shape_texts(&shape.shape, shape.clip_rect, &mut texts, &mut geometry);
+        }
+        texts
+    };
+    let fetched = |text: &str| {
+        let blob: Blob<blobencodings::UTF8String> = text.to_blob();
+        let raw = blob.get_handle().raw;
+        tracker.lock().unwrap().blobs.iter().any(|hash| hash.raw == raw)
+    };
+    let mut events = Vec::new();
+    // These are actual UI clicks and bounded asynchronous reads, not calls
+    // to a second renderer or a manually selected opening handle.
+    for label in ["What it lived", "Prepared opening input", "End of the prepared opening input."] {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let texts = loop {
+            let texts = frame(std::mem::take(&mut events));
+            if texts.iter().any(|(text, _)| text == label) {
+                break texts;
+            }
+            assert!(Instant::now() < deadline, "missing {label}: {texts:?}");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(!fetched(WAKE), "opening navigation must not fetch the separate wake");
+        if label == "End of the prepared opening input." {
+            assert!(fetched(PROMPT), "the actual opening render read its prompt");
+            let rendered: Vec<_> = texts.iter()
+                .map(|(text, _)| text.as_str())
+                .filter(|text| text.contains("PROMPT-ONLY") || text.contains("WAKE-ONLY"))
+                .collect();
+            assert_eq!(rendered, [PROMPT], "exact prompt, without substitution or concatenation");
+        } else {
+            assert!(!fetched(PROMPT), "a closed opening remains lazy");
+            let matches: Vec<_> = texts.iter().filter(|(text, _)| text == label).collect();
+            assert_eq!(matches.len(), 1, "the selected Spawn route has one run");
+            let pos = matches[0].1.center();
+            events = vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos, button: egui::PointerButton::Primary, pressed: true,
+                    modifiers: Default::default(),
+                },
+                egui::Event::PointerButton {
+                    pos, button: egui::PointerButton::Primary, pressed: false,
+                    modifiers: Default::default(),
+                },
+            ];
+        }
+    }
+    fixture.pile.close().unwrap();
+}
+
+#[test]
 fn an_opened_run_shows_its_prepared_input_and_its_own_turns_on_demand() {
     let mut fixture = Fixture::new();
     let (observation, tracker) = fixture.observe(1);
