@@ -500,8 +500,8 @@ impl KnowledgeStorage<'_> {
     }
 }
 
-/// Preparation selects facts and latest-state support once, acquiring exact
-/// residual payloads and then the bodies the operation actually reads. It
+/// Preparation selects stored facts and latest-state support once, acquiring
+/// selected cover payloads and then the bodies the operation actually reads. It
 /// does not replace either selected view after a cache fill. An edit therefore
 /// supersedes the frontier it saw; later delivered revisions may branch that
 /// entry's history, which is what a monotone store is for.
@@ -544,13 +544,13 @@ fn views_in<T>(
         .attached_acquiring(latest)
         .context("observe Knowledge supersession index")?;
     // This is the history this observation knows, not a globally complete
-    // history. Read every selected foundation or report its missing bytes;
-    // never silently turn a selected-but-unread foundation into absence.
+    // history. Read the stored cover and report every uncovered foundation;
+    // resident raw bytes do not make a pending attachment visible.
     // An unseen later commit can still branch an edit's history. The edit
     // ensures its own images after it commits.
     //
-    // With a notes sink the read is over what is here instead: a foundation
-    // the acquisition could not bring is named in a note, not refused.
+    // With a notes sink the read is over the stored cover instead: a foundation
+    // still awaiting a usable attachment is named in a note, not refused.
     let mut unread_notes = Vec::new();
     let mut keep =
         |unread: triblespace::core::collection::Support<blobencodings::SimpleArchive>,
@@ -3202,13 +3202,58 @@ mod tests {
     }
 
     #[test]
-    fn a_malformed_knowledge_foundation_fails_reads_loudly() {
+    fn a_malformed_raw_knowledge_foundation_stays_pending() {
         let fixture = Fixture::new();
         let knowledge = Knowledge::with_storage(fixture.storage.clone());
         let here = knowledge
             .create("resident page", "Resident body.", &[], false)
             .unwrap();
-        plant_knowledge(&fixture, crate::storage::residual_fixture::malformed);
+        let pending = plant_knowledge(&fixture, crate::storage::residual_fixture::malformed);
+        let before = fixture
+            .storage
+            .with_pile(|pile, _| Ok(pile.snapshot()?.records()?.collect::<Result<Vec<_>, _>>()?))
+            .unwrap();
+        let shown = knowledge.show(&format!("{here:x}"), false).unwrap();
+        assert!(shown.contains("Resident body."));
+        assert!(shown.notes.iter().any(|note| note.contains(&pending)));
+        let listed = knowledge.list(&ListOptions::default()).unwrap();
+        assert!(listed.contains("resident page"));
+        assert!(listed.notes.iter().any(|note| note.contains(&pending)));
+        let health =
+            crate::knowledge::health::KnowledgeHealth::with_storage(fixture.storage.clone())
+                .health()
+                .unwrap();
+        assert!(health.notes.iter().any(|note| note.contains(&pending)));
+        let error = knowledge
+            .edit(&format!("{here:x}"), Some("replacement"), None, &[], false)
+            .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::storage::IncompleteAttachedRead>()
+                .is_some(),
+            "{error:#}"
+        );
+        let after = fixture
+            .storage
+            .with_pile(|pile, _| Ok(pile.snapshot()?.records()?.collect::<Result<Vec<_>, _>>()?))
+            .unwrap();
+        assert_eq!(
+            before, after,
+            "reads and refused edits do not map the raw fault"
+        );
+    }
+
+    #[test]
+    fn a_malformed_selected_knowledge_attachment_fails_reads_loudly() {
+        let fixture = Fixture::new();
+        let knowledge = Knowledge::with_storage(fixture.storage.clone());
+        let here = knowledge
+            .create("resident page", "Resident body.", &[], false)
+            .unwrap();
+        crate::storage::residual_fixture::malformed_attachment_in(
+            &fixture.storage,
+            schema::DEFAULT_SCOPE_ID,
+        );
         let error = knowledge.show(&format!("{here:x}"), false).unwrap_err();
         assert!(
             error
@@ -3309,7 +3354,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_answer_for_every_revision_the_facts_hold_before_the_worker_carries() {
+    fn reads_keep_stored_revisions_and_name_pending_raw_commits_until_host_upkeep() {
         let fixture = Fixture::new();
         let storage = fixture.storage();
         let source = storage
@@ -3339,16 +3384,14 @@ mod tests {
             .unwrap();
         // A raw commit is the worker's to carry; no read images it.
         fixture.carry(&[]);
-        let owner_read = || {
-            storage
-                .with_pile(|pile, signer, runtime| {
-                    views_in(pile, source, signer, &[], runtime, None, |view, _| {
-                        Ok(view.clone())
-                    })
+        let owner_read = |notes: Option<&std::cell::RefCell<Vec<String>>>| {
+            storage.with_pile(|pile, signer, runtime| {
+                views_in(pile, source, signer, &[], runtime, notes, |view, _| {
+                    Ok(view.clone())
                 })
-                .unwrap()
+            })
         };
-        let current = owner_read();
+        let current = owner_read(None).unwrap();
         let entry = knowledge_model::entry(&current.facts, &current.latest, root).unwrap();
         let mut successor = Fragment::empty();
         let next = stage_revision(
@@ -3360,25 +3403,34 @@ mod tests {
             BTreeSet::new(),
         )
         .unwrap();
-        storage
-            .with_pile(|pile, signer, _| {
-                pile.commit(source, signer, successor)?;
-                Ok(())
-            })
+        let pending = storage
+            .with_pile(|pile, signer, _| Ok(pile.commit(source, signer, successor)?.data()))
             .unwrap();
+        let pending = hex::encode(pending.raw);
 
-        // The worker has not attached the new revision yet. The read takes
-        // the supersession index as the worker last attached it and builds
-        // the new revision's image in memory, as it reads its facts from
-        // their own bytes, so the index and the facts answer for the same
-        // revisions: the frontier is already the successor. A read
-        // publishes nothing.
+        // Raw received facts have no host attachment yet. Strict reads refuse;
+        // noted reads retain the old stored revision and name the gap without
+        // constructing or publishing the successor's image.
         let before = storage
             .with_pile(|pile, _, _| {
                 Ok(pile.snapshot()?.records()?.collect::<Result<Vec<_>, _>>()?)
             })
             .unwrap();
-        let resident = owner_read();
+        match owner_read(None) {
+            Err(error) => assert!(
+                error
+                    .downcast_ref::<crate::storage::IncompleteAttachedRead>()
+                    .is_some(),
+                "{error:#}",
+            ),
+            Ok(_) => panic!("strict read must refuse the pending successor"),
+        }
+        let notes = std::cell::RefCell::new(Vec::new());
+        let resident = owner_read(Some(&notes)).unwrap();
+        assert!(
+            notes.borrow().iter().any(|note| note.contains(&pending)),
+            "the pending foundation must be named"
+        );
         let entry = knowledge_model::entry(&resident.facts, &resident.latest, root).unwrap();
         assert_eq!(
             entry
@@ -3386,13 +3438,13 @@ mod tests {
                 .iter()
                 .map(|head| head.id)
                 .collect::<Vec<_>>(),
-            [next]
+            [root]
         );
         assert_eq!(
             revision_content(&resident.reader, &entry.frontier[0]).unwrap(),
-            "new body"
+            "old body"
         );
-        assert!(knowledge_model::revision_ids(&resident.facts).contains(&next));
+        assert!(!knowledge_model::revision_ids(&resident.facts).contains(&next));
         assert_eq!(
             storage
                 .with_pile(|pile, _, _| Ok(pile
@@ -3404,9 +3456,9 @@ mod tests {
             "a read publishes nothing",
         );
 
-        // The worker's carry attaches the revision; the answer stays.
+        // Explicit host upkeep attaches the successor; a fresh read advances.
         fixture.carry(&[]);
-        let current = owner_read();
+        let current = owner_read(None).unwrap();
         let entry = knowledge_model::entry(&current.facts, &current.latest, root).unwrap();
         assert_eq!(
             entry

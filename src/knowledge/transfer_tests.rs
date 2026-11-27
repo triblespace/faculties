@@ -60,6 +60,13 @@ fn content_hex(bytes: &[u8]) -> String {
 
 impl Fixture {
     fn new() -> Self {
+        let fixture = Self::pending();
+        fixture.ensure_source_views();
+        fixture
+    }
+
+    /// Raw received commits, before this host's explicit attachment upkeep.
+    fn pending() -> Self {
         let directory = tempfile::tempdir().unwrap();
         let pile = directory.path().join("node.pile");
         let key = directory.path().join("node.key");
@@ -229,6 +236,25 @@ impl Fixture {
         .storage(self.pile.clone(), Some(self.key.clone()))
     }
 
+    /// The original key curates source facts; the node host publishes their
+    /// local attachments. Transfer itself must never perform this source write.
+    fn ensure_source_views(&self) {
+        Storage::new(self.pile.clone(), Some(self.key.clone()))
+            .with_store(|store, signer, runtime| {
+                let snapshot = store.snapshot()?;
+                let knowledge = Collection::open(&snapshot, self.source_knowledge)?;
+                let files = Collection::open(&snapshot, self.source_files)?;
+                runtime.block_on(async {
+                    let latest = knowledge_model::latest_for_source(store, knowledge)?;
+                    crate::storage::seed_attached(store, latest, signer).await?;
+                    crate::storage::ensure_downstream(store, knowledge, signer).await?;
+                    crate::storage::ensure_downstream(store, files, signer).await?;
+                    Ok(())
+                })
+            })
+            .unwrap();
+    }
+
     /// A later source commit by the original key.
     fn commit_source(&self, fragment: Fragment) {
         Storage::new(self.pile.clone(), Some(self.key.clone()))
@@ -238,6 +264,7 @@ impl Fixture {
                 Ok(())
             })
             .unwrap();
+        self.ensure_source_views();
     }
 
     fn knowledge(&self, workspace: Id) -> Knowledge {
@@ -296,6 +323,55 @@ fn carried(report: &TransferReport) -> BTreeSet<(Id, Reason)> {
         .iter()
         .map(|item| (item.id, item.reason))
         .collect()
+}
+
+#[test]
+fn transfer_requires_explicit_host_upkeep_for_received_source_commits() {
+    let fixture = Fixture::pending();
+    let records = || {
+        Storage::new(fixture.pile.clone(), Some(fixture.key.clone()))
+            .with_store(|store, _, _| {
+                Ok(store
+                    .snapshot()?
+                    .records()?
+                    .collect::<Result<Vec<_>, _>>()?)
+            })
+            .unwrap()
+    };
+    let before = records();
+    let error = fixture
+        .transfer(
+            fixture.source,
+            fixture.destination,
+            TransferOptions::default(),
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .downcast_ref::<crate::storage::IncompleteAttachedRead>()
+            .is_some(),
+        "resident raw source is pending, not a missing revision: {error:#}"
+    );
+    assert_eq!(records(), before, "transfer must not publish source MAPs");
+
+    fixture.ensure_source_views();
+    let report = fixture
+        .transfer(
+            fixture.source,
+            fixture.destination,
+            TransferOptions::default(),
+        )
+        .unwrap();
+    assert!(report.verified);
+    assert_eq!(report.publications, 1);
+    assert_eq!(
+        knowledge_model::revision_records(&fixture.knowledge_facts(fixture.source), fixture.guide),
+        knowledge_model::revision_records(
+            &fixture.knowledge_facts(fixture.destination),
+            fixture.guide
+        ),
+        "host upkeep changes representation, not the received revision"
+    );
 }
 
 #[test]
