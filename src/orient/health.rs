@@ -112,7 +112,7 @@ impl HealthSources {
                     .into_iter()
                     .chain(self.service_events.as_ref())
                 {
-                    // A report left unattached is read from its own bytes.
+                    // A report left unattached stays pending in the stored view.
                     crate::storage::tolerate_own_lag(
                         local.maintain_attached(source.succinct, signer).await,
                     )?;
@@ -128,8 +128,7 @@ impl HealthSources {
                 // Only this optional projection is best effort; health, Relations
                 // and latest-target failures above still propagate unchanged. It
                 // is the ordinary path's own upkeep on the resident-only store,
-                // so a receipt left unattached is read from its own bytes here
-                // too.
+                // so a receipt left unattached may allow an event to repeat.
                 let receipt_result = self.presentations.maintain(local, signer).await;
                 Ok(receipt_result.err().map(|error| {
                     format!(
@@ -426,8 +425,8 @@ impl HealthSources {
         let latest_collection = trace_refresh_call("Swarm health latest", "attach", || {
             snapshot.attached(self.latest)
         })?;
-        // The register over the same foundations the health facts read: a
-        // report no attachment reaches yet is built in memory.
+        // Read the stored register independently of the fact cover. A winner
+        // absent from those facts cannot contribute a joined report.
         let latest_index = trace_refresh_call("Swarm health latest", "view", || {
             latest_collection
                 .read::<LwwIndex>()
@@ -3492,7 +3491,7 @@ mod tests {
     }
 
     #[test]
-    fn health_reader_reads_input_nothing_has_attached_yet() {
+    fn non_host_health_reader_keeps_stored_input_until_host_upkeep() {
         let mut f = Fixture::new();
         let mut recorder = Recorder::new(f.signer.verifying_key());
         let first = recorder
@@ -3522,8 +3521,11 @@ mod tests {
             pattern!(observed.facts.view(), [{ ?report @ metadata::tag: &schema::KIND_REPORT }])
         )
         .collect::<BTreeSet<_>>();
-        // The report nothing has attached yet is read from its own bytes.
-        assert_eq!(reports, BTreeSet::from([first_id, second_id]));
+        // The other signer cannot publish this store's MAPs. Its read retains
+        // the first stored report and exposes the second as pending.
+        assert_eq!(reports, BTreeSet::from([first_id]));
+        assert_eq!(observed.facts.collection.residual().len(), 1);
+        assert_eq!(observed.latest_collection.residual().len(), 1);
         assert_eq!(
             f.store
                 .snapshot()
@@ -3537,6 +3539,18 @@ mod tests {
         );
         assert!(observed.presentations.is_empty());
         assert!(observed.snapshot.wants().unwrap().next().is_none());
+        let ready = f.sources.observe(&mut f.store, &f.signer).unwrap();
+        assert!(exists!(pattern!(ready.facts.view(), [
+            { second_id @ metadata::tag: &schema::KIND_REPORT }
+        ])));
+        assert!(ready.facts.collection.residual().is_empty());
+        assert!(ready.latest.contains(second_id));
+        assert!(
+            !exists!(pattern!(observed.facts.view(), [
+                { second_id @ metadata::tag: &schema::KIND_REPORT }
+            ])),
+            "upkeep must not replace the earlier observation"
+        );
     }
 
     #[test]
@@ -3610,7 +3624,7 @@ mod tests {
 
         // Receipt ownership is the signing zooid, independent of the selected
         // contact. An earlier source COMMIT must be carried before reporting.
-        let reader_key = SigningKey::from_bytes(&[73; 32]);
+        let reader_key = f.signer.clone();
         f.sources.presentations = {
             let mut local = f.store.store();
             ReceiptSource::register(&mut *local, &reader_key).unwrap()
@@ -3631,15 +3645,16 @@ mod tests {
             .unwrap()
             .cover()
             .clone();
-        // The unattached receipt is read from its own bytes, so the events
-        // are presented before any upkeep attaches it.
+        // A raw receipt does not yet suppress an event. Ordinary observation
+        // performs the host's admitted upkeep before deciding delivery.
         let lagging = f.sources.at(before, clock::now().unwrap()).unwrap();
         assert!(events
             .iter()
-            .all(|event| lagging.presentations.contains(*event)));
+            .all(|event| !lagging.presentations.contains(*event)));
+        assert_eq!(lagging.presentations.collection.residual().len(), 1);
         assert!(matches!(
             lagging.news(persona, &lagging.report()),
-            News::Quiet
+            News::Report { .. }
         ));
         let ready = f.sources.observe(&mut f.store, &reader_key).unwrap();
         assert!(events
@@ -4069,15 +4084,27 @@ mod tests {
         writer
             .commit(f.sources.health.source, &f.signer, second)
             .unwrap();
-        // The raced report is read from its own bytes before any upkeep
-        // attaches it, so the refreshed view already has it.
+        // The race invalidates the observation but the raw report stays pending
+        // until the next upkeep. The prior watermark must not hide that work.
         let raced = f.store.snapshot().unwrap();
         f.sources.refresh_poll_view(raced, at(3.0)).unwrap();
-        assert!(exists!(
+        assert!(!exists!(
             pattern!(f.sources.poll_view.as_ref().unwrap().1.facts.view(), [
                 { second_id @ metadata::tag: &schema::KIND_REPORT }
             ])
         ));
+        assert_eq!(
+            f.sources
+                .poll_view
+                .as_ref()
+                .unwrap()
+                .1
+                .facts
+                .collection
+                .residual()
+                .len(),
+            1
+        );
 
         assert!(f
             .sources
@@ -4254,11 +4281,11 @@ mod tests {
             .attention
             .is_empty());
 
-        f.publish(
-            recorder
-                .record(at(2.0), [store_condition(State::Current, false)])
-                .unwrap(),
-        );
+        let recovered = recorder
+            .record(at(2.0), [store_condition(State::Current, false)])
+            .unwrap();
+        let recovered_id = recovered.root().unwrap();
+        f.publish(recovered);
         {
             let mut local = f.store.store();
             drop(pollster::block_on(local.maintain_attached(f.sources.latest, &f.signer)).unwrap());
@@ -4272,20 +4299,33 @@ mod tests {
             .refresh_poll_view(sampled.clone(), at(3.0))
             .unwrap();
         assert_eq!(f.sources.poll_observations, 2);
-        // Nothing attached the new report to the facts; they read it from its
-        // bytes, so the recovery it records is what the refreshed view shows.
+        // The stored winner advances independently, but its report facts are
+        // still pending. Do not fabricate a recovery or keep a stale winner.
         let observed = &f.sources.poll_view.as_ref().unwrap().1;
         assert_eq!(observed.facts.collection.cover(), &original_facts);
+        assert!(observed.latest.contains(recovered_id));
+        assert_eq!(observed.facts.collection.residual().len(), 1);
         let report = observed.report();
-        assert!(!report.attention.is_empty());
-        assert!(report.text.contains("fresh"));
-        assert!(!report.text.contains("not observed / not configured"));
+        assert!(report.attention.is_empty());
+        assert!(report.text.contains("not observed / not configured"));
         assert!(f
             .store
             .snapshot()
             .unwrap()
             .changes_since(&sampled)
             .is_empty());
+
+        // Once actual host upkeep publishes the missing facts, refreshing
+        // those targets exposes the recovery through the same positive join.
+        f.sources.maintain(&mut f.store, &f.signer).unwrap();
+        f.sources
+            .refresh_poll_view(f.store.snapshot().unwrap(), at(3.0))
+            .unwrap();
+        assert_eq!(f.sources.poll_observations, 3);
+        let report = f.sources.poll_view.as_ref().unwrap().1.report();
+        assert!(!report.attention.is_empty());
+        assert!(report.text.contains("fresh"));
+        assert!(!report.text.contains("not observed / not configured"));
     }
 
     #[test]
@@ -4327,9 +4367,8 @@ mod tests {
                 },
             )
             .unwrap();
-        // The receipt is read from its own bytes before any upkeep attaches
-        // it: the poll view is no longer current, and the refreshed one
-        // presents the events at once.
+        // A raw receipt invalidates the prior observation but does not yet
+        // suppress delivery: only its stored projection supplies membership.
         let committed = f.store.snapshot().unwrap();
         assert!(!f
             .sources
@@ -4345,10 +4384,11 @@ mod tests {
         let observed = &f.sources.poll_view.as_ref().unwrap().1;
         assert!(events
             .iter()
-            .all(|event| observed.presentations.contains(*event)));
+            .all(|event| !observed.presentations.contains(*event)));
+        assert_eq!(observed.presentations.collection.residual().len(), 1);
         assert!(matches!(
             observed.news(persona, &observed.report()),
-            News::Quiet
+            News::Report { .. }
         ));
         assert!(f
             .store
