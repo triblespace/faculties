@@ -23,7 +23,9 @@ use triblespace::prelude::*;
 use crate::quota::status::{self, PageItem, ProviderStatus};
 use crate::quota::{self, Observation, TextHandle};
 use crate::schemas::quota::{provider_status, quota as attributes, DEFAULT_SCOPE_ID};
-use crate::storage::{AcquiringReader, FactArchive, FacultyAccess, FacultySnapshot, FacultyStore};
+use crate::storage::{
+    AcquiringReader, FactArchive, FacultyAccess, FacultySnapshot, FacultyStore, Noted,
+};
 
 /// Configured Quota operations. Inputs are literal; nothing ambient is read
 /// here except the clock.
@@ -198,22 +200,50 @@ impl Quota {
 
     /// Read all matching observations, without collapsing reset windows or
     /// selecting a latest value. Bounds are Unix seconds, [since, until).
-    pub fn history(&self, since: i64, until: i64) -> Result<super::history::HistoryView> {
+    /// Read over what is here: readings in a foundation that could not be
+    /// loaded are missing from the history, and the notes name it.
+    pub fn history(&self, since: i64, until: i64) -> Result<Noted<super::history::HistoryView>> {
         anyhow::ensure!(since < until, "since must be before until");
         self.storage.with_store(|pile, signer, runtime| {
-            let (facts, snapshot) = maintain_and_observe(&self.storage, pile, signer, runtime)?;
-            super::history::observe(&facts, &snapshot, since, until)
+            let (facts, snapshot, notes) =
+                maintain_and_observe(&self.storage, pile, signer, runtime, false)?;
+            Ok(Noted {
+                value: super::history::observe(&facts, &snapshot, since, until)?,
+                notes,
+            })
         })
     }
 
+    /// The latest observation per group, read completely: a launcher choosing
+    /// a provider or a rule acting on an allowance decides on it, and a
+    /// newer reading held in a foundation that is away would leave an older
+    /// one standing as the latest. [`Self::show_read`] is the display.
     pub fn show(&self) -> Result<QuotaView> {
         self.show_at(crate::clock::tai_nanoseconds_now()?)
     }
 
-    /// The latest observation per group, evaluated at an explicit instant.
+    /// [`Self::show`] evaluated at an explicit instant.
     pub fn show_at(&self, now: i128) -> Result<QuotaView> {
         self.storage.with_store(|pile, signer, runtime| {
             observe_at(&self.storage, pile, signer, runtime, now)
+        })
+    }
+
+    /// [`Self::show`] over what is here, for display: the notes name each
+    /// foundation that could not be loaded, whose readings the view omits.
+    pub fn show_read(&self) -> Result<Noted<QuotaView>> {
+        self.show_read_at(crate::clock::tai_nanoseconds_now()?)
+    }
+
+    /// [`Self::show_read`] evaluated at an explicit instant.
+    pub fn show_read_at(&self, now: i128) -> Result<Noted<QuotaView>> {
+        self.storage.with_store(|pile, signer, runtime| {
+            let (facts, snapshot, notes) =
+                maintain_and_observe(&self.storage, pile, signer, runtime, false)?;
+            Ok(Noted {
+                value: view_at(&facts, &snapshot, now)?,
+                notes,
+            })
         })
     }
 }
@@ -228,8 +258,17 @@ pub fn observe_at(
     runtime: &Arc<tokio::runtime::Runtime>,
     now: i128,
 ) -> Result<QuotaView> {
-    let (facts, snapshot) = maintain_and_observe(storage, pile, signer, runtime)?;
-    let rows = quota::observation_rows(&facts);
+    let (facts, snapshot, _) = maintain_and_observe(storage, pile, signer, runtime, true)?;
+    view_at(&facts, &snapshot, now)
+}
+
+/// The latest observation per group in `facts`, at `now`.
+fn view_at(
+    facts: &FactArchive,
+    snapshot: &AcquiringReader<FacultySnapshot>,
+    now: i128,
+) -> Result<QuotaView> {
+    let rows = quota::observation_rows(facts);
     let examined = rows
         .iter()
         .map(|row| row.event)
@@ -240,27 +279,27 @@ pub fn observe_at(
         .map(|row| {
             let event = row.event;
             let provider = row.key.provider;
-            let provider_name = provider_name(&facts, &snapshot, provider)?;
-            let (used_percent, resets_at) = quota::reading_values(&facts, event);
+            let provider_name = provider_name(facts, snapshot, provider)?;
+            let (used_percent, resets_at) = quota::reading_values(facts, event);
             let mut resets_at = resets_at.collect::<Vec<_>>();
             resets_at.sort_unstable();
             let mut host = find!(
                 host: TextHandle,
-                pattern!(&facts, [{ event @ attributes::host: ?host }])
+                pattern!(facts, [{ event @ attributes::host: ?host }])
             )
-            .map(|host| read_text(&snapshot, host, "host"))
+            .map(|host| read_text(snapshot, host, "host"))
             .collect::<Result<Vec<_>>>()?;
             host.sort();
             Ok(QuotaGroup {
                 event,
                 provider,
                 provider_name,
-                account: read_text(&snapshot, row.key.account, "account")?,
+                account: read_text(snapshot, row.key.account, "account")?,
                 window_secs: i64::try_from(row.key.window / 1_000_000_000).unwrap_or(i64::MAX),
                 bucket: row
                     .key
                     .bucket
-                    .map(|bucket| read_text(&snapshot, bucket, "bucket"))
+                    .map(|bucket| read_text(snapshot, bucket, "bucket"))
                     .transpose()?,
                 observed: row.observed,
                 used_percent: used_percent.collect(),
@@ -285,7 +324,7 @@ pub fn observe_at(
                 &right.bucket,
             ))
     });
-    let (status_examined, statuses, status_error) = match observe_statuses(&facts, &snapshot) {
+    let (status_examined, statuses, status_error) = match observe_statuses(facts, snapshot) {
         Ok((examined, statuses)) => (examined, statuses, None),
         Err(error) => (0, Vec::new(), Some(format!("{error:#}"))),
     };
@@ -424,12 +463,15 @@ where
 }
 
 /// Advance this key's own commits into the Rank9 view and freeze it.
+/// `complete` refuses a read that could not load every foundation; otherwise
+/// the notes name the ones it could not.
 fn maintain_and_observe(
     storage: &crate::storage::Storage,
     pile: &mut impl FacultyAccess,
     signer: &SigningKey,
     runtime: &Arc<tokio::runtime::Runtime>,
-) -> Result<(FactArchive, AcquiringReader<FacultySnapshot>)> {
+    complete: bool,
+) -> Result<(FactArchive, AcquiringReader<FacultySnapshot>, Vec<String>)> {
     let control = pile.read_control();
     let source = if let (Some(control), Some(handle)) = (
         control.clone(),
@@ -471,9 +513,14 @@ fn maintain_and_observe(
         Some(control) => snapshot.with_control(control),
         None => snapshot,
     };
-    let facts =
-        crate::storage::acquire_facts(&snapshot, rank9).context("read Quota Rank9 collection")?;
-    Ok((facts, snapshot))
+    let mut notes = Vec::new();
+    let facts = if complete {
+        crate::storage::acquire_facts(&snapshot, rank9)
+    } else {
+        crate::storage::acquire_facts_noted(&snapshot, rank9, "Quota", &mut notes)
+    }
+    .context("read Quota Rank9 collection")?;
+    Ok((facts, snapshot, notes))
 }
 
 fn commit_quota(
@@ -1070,5 +1117,52 @@ mod tests {
         assert_eq!(view.examined, 0);
         assert!(view.groups.is_empty());
         assert!(rendered(&view).contains("0 observations examined, 0 groups shown"));
+    }
+
+    /// A foundation of the collection is stranded on another host: a
+    /// reading is still recorded, the display and the history answer over
+    /// what is here and name it, and the view deciders read refuses.
+    #[test]
+    fn readings_are_recorded_and_shown_while_a_quota_foundation_is_away() {
+        use crate::storage::residual_fixture::{
+            refuses_incomplete, storage, strand_in, unrelated_fragment,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let storage = storage(directory.path());
+        let quota = Quota::with_storage(storage.clone());
+        quota
+            .record(reading(5 * HOUR as u64, 40.0, NOW - 120))
+            .unwrap();
+        let away = strand_in(&storage, DEFAULT_SCOPE_ID, unrelated_fragment());
+        let named = |notes: &[String]| notes.iter().any(|note| note.contains(&away));
+
+        quota
+            .record(reading(5 * HOUR as u64, 55.0, NOW - 60))
+            .unwrap();
+        let shown = quota.show_read_at(now()).unwrap();
+        assert!(named(&shown.notes), "{:?}", shown.notes);
+        assert_eq!(shown.groups.len(), 1);
+        assert_eq!(shown.groups[0].used_percent, [55.0]);
+        let history = quota.history(NOW - 600, NOW).unwrap();
+        assert!(named(&history.notes), "{:?}", history.notes);
+        assert_eq!(history.observations, 2);
+
+        let error = quota.show_at(now()).unwrap_err();
+        assert!(refuses_incomplete(&error, &away), "{error:#}");
+        storage.close().unwrap();
+    }
+
+    #[test]
+    fn a_malformed_quota_foundation_fails_loudly() {
+        use crate::storage::residual_fixture::{is_fault, malformed_in, storage};
+        let directory = tempfile::tempdir().unwrap();
+        let storage = storage(directory.path());
+        let quota = Quota::with_storage(storage.clone());
+        malformed_in(&storage, DEFAULT_SCOPE_ID);
+        let error = quota.show_read_at(now()).unwrap_err();
+        assert!(is_fault(&error), "{error:#}");
+        let error = quota.history(NOW - 600, NOW).unwrap_err();
+        assert!(is_fault(&error), "{error:#}");
+        storage.close().unwrap();
     }
 }

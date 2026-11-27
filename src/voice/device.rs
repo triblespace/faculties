@@ -546,9 +546,13 @@ pub struct RouteReport {
     pub soma: Option<String>,
     pub soma_up: bool,
     pub routes: Vec<(super::RoutePolicy, Routed)>,
+    /// What the policy read could not load
+    /// ([`crate::storage::unread_foundations_note`]).
+    pub notes: Vec<String>,
 }
 impl RouteReport {
     pub fn emit(&self, out: &mut Out<'_>) -> Result<()> {
+        out.notes(&self.notes)?;
         out.line(format!(
             "Reachy daemon: {}",
             if self.daemon_up { "reachable" } else { "down" }
@@ -641,7 +645,10 @@ impl Device {
         }
     }
     pub fn routes(&self) -> Result<RouteReport> {
-        let policies = self.voice.routes()?;
+        let crate::storage::Noted {
+            value: policies,
+            notes,
+        } = self.voice.routes()?;
         let devices = detect_output_devices()?;
         let daemon_up = reachy_reachable(&self.daemon);
         let soma_up = self.soma.as_deref().is_some_and(soma_reachable);
@@ -666,6 +673,7 @@ impl Device {
             soma: self.soma.clone(),
             soma_up,
             routes,
+            notes,
         })
     }
     /// Explicit host speech. Output acceptance never means audio was played;

@@ -187,8 +187,17 @@ impl<T> Selected<T> {
     }
 }
 
-fn card<H, T, I, F>(nb: &mut NotebookCtx, host: H, key: &str, init: I, mut render: F)
-where
+/// One card over the host's context. `inputs` are the sources the card
+/// reads: a read of one that could not load every foundation is said above
+/// the card, so a partial answer is never taken for the whole one.
+fn card<H, T, I, F>(
+    nb: &mut NotebookCtx,
+    host: H,
+    key: &str,
+    inputs: &'static [SourceKey],
+    init: I,
+    mut render: F,
+) where
     H: Host,
     T: Send + Sync + 'static,
     I: Fn() -> T + Copy + 'static,
@@ -207,10 +216,21 @@ where
         },
         move |ctx, state| {
             host.with_context(ctx, |ctx, sources, generation, open| {
+                partial_inputs(ctx, sources, inputs);
                 render(ctx, state.for_generation(generation, init), sources, open);
             });
         },
     );
+}
+
+/// Each distinct note of the inputs' reads, as one small line.
+fn partial_inputs(ctx: &mut CardCtx<'_>, sources: WidgetContext<'_>, inputs: &[SourceKey]) {
+    let mut seen = std::collections::BTreeSet::new();
+    for note in inputs.iter().flat_map(|key| sources.notes(*key)) {
+        if seen.insert(note.as_str()) {
+            ctx.ui_mut().small(format!("Showing what is here: {note}"));
+        }
+    }
 }
 
 /// The same ordered cards for standalone notebooks and workspace hosts.
@@ -221,6 +241,7 @@ pub fn compose_hosted(nb: &mut NotebookCtx, target: Target, host: impl Host) {
             nb,
             host.clone(),
             "profiles",
+            &[SourceKey::Profiles],
             ProfilesViewer::default,
             move |ctx, panel, sources, _open| {
                 let Some(profiles) = sources.dataset(SourceKey::Profiles) else {
@@ -239,6 +260,7 @@ pub fn compose_hosted(nb: &mut NotebookCtx, target: Target, host: impl Host) {
             nb,
             host.clone(),
             "colony",
+            &crate::widgets::colony::SOURCES,
             ColonyViewer::default,
             |ctx, panel, sources, _| {
                 panel.render(ctx, sources);
@@ -251,6 +273,7 @@ pub fn compose_hosted(nb: &mut NotebookCtx, target: Target, host: impl Host) {
             nb,
             host.clone(),
             "rules",
+            &crate::widgets::rules::INPUTS,
             RulesViewer::default,
             |ctx, panel, sources, _| {
                 panel.render(ctx, sources);
@@ -263,6 +286,7 @@ pub fn compose_hosted(nb: &mut NotebookCtx, target: Target, host: impl Host) {
             nb,
             host.clone(),
             "quota",
+            &[],
             crate::widgets::QuotaViewer::default,
             |ctx, panel, sources, _| panel.render(ctx, sources),
         );
@@ -273,6 +297,13 @@ pub fn compose_hosted(nb: &mut NotebookCtx, target: Target, host: impl Host) {
             nb,
             host.clone(),
             "timeline",
+            &[
+                SourceKey::Goals,
+                SourceKey::Messages,
+                SourceKey::Knowledge,
+                SourceKey::Reason,
+                SourceKey::Archive,
+            ],
             || {
                 BranchTimeline::multi(vec![
                     TimelineSource::Goals {
@@ -308,6 +339,7 @@ pub fn compose_hosted(nb: &mut NotebookCtx, target: Target, host: impl Host) {
             nb,
             host.clone(),
             "knowledge-health",
+            &[SourceKey::Knowledge],
             KnowledgeHealthViewer::default,
             move |ctx, panel, sources, _open| {
                 let Some(view) = sources.dataset(SourceKey::Knowledge) else {
@@ -323,6 +355,7 @@ pub fn compose_hosted(nb: &mut NotebookCtx, target: Target, host: impl Host) {
             nb,
             host.clone(),
             "knowledge",
+            &[SourceKey::Knowledge],
             KnowledgeViewer::default,
             move |ctx, knowledge, sources, open| {
                 let Some(view) = sources.dataset(SourceKey::Knowledge) else {
@@ -343,6 +376,7 @@ pub fn compose_hosted(nb: &mut NotebookCtx, target: Target, host: impl Host) {
             nb,
             host.clone(),
             "goals",
+            &[SourceKey::Goals],
             GoalsBoard::default,
             move |ctx, goals, sources, _open| {
                 let Some(view) = sources.dataset(SourceKey::Goals) else {
@@ -358,6 +392,7 @@ pub fn compose_hosted(nb: &mut NotebookCtx, target: Target, host: impl Host) {
             nb,
             host.clone(),
             "priority-game",
+            &[SourceKey::Goals],
             PriorityGame::default,
             move |ctx, game, sources, act| {
                 let Some(view) = sources.dataset(SourceKey::Goals) else {
@@ -380,6 +415,7 @@ pub fn compose_hosted(nb: &mut NotebookCtx, target: Target, host: impl Host) {
             nb,
             host.clone(),
             "decisions",
+            &[SourceKey::Decisions],
             DecisionsPanel::default,
             move |ctx, panel, sources, _open| {
                 let Some(view) = sources.dataset(SourceKey::Decisions) else {
@@ -395,6 +431,7 @@ pub fn compose_hosted(nb: &mut NotebookCtx, target: Target, host: impl Host) {
             nb,
             host.clone(),
             "mail",
+            &[SourceKey::Mail],
             MailViewer::default,
             move |ctx, panel, sources, _open| {
                 let Some(view) = sources.dataset(SourceKey::Mail) else {
@@ -410,6 +447,7 @@ pub fn compose_hosted(nb: &mut NotebookCtx, target: Target, host: impl Host) {
             nb,
             host.clone(),
             "events",
+            &[SourceKey::Events],
             EventsViewer::default,
             move |ctx, panel, sources, _open| {
                 let Some(view) = sources.dataset(SourceKey::Events) else {
@@ -425,6 +463,7 @@ pub fn compose_hosted(nb: &mut NotebookCtx, target: Target, host: impl Host) {
             nb,
             host.clone(),
             "messages",
+            &[SourceKey::Messages],
             MessagesPanel::default,
             move |ctx, panel, sources, _open| {
                 let Some(view) = sources.dataset(SourceKey::Messages) else {
@@ -440,6 +479,7 @@ pub fn compose_hosted(nb: &mut NotebookCtx, target: Target, host: impl Host) {
             nb,
             host.clone(),
             "discord",
+            &[SourceKey::Discord],
             DiscordViewer::default,
             move |ctx, panel, sources, _open| {
                 let Some(view) = sources.dataset(SourceKey::Discord) else {
@@ -455,6 +495,7 @@ pub fn compose_hosted(nb: &mut NotebookCtx, target: Target, host: impl Host) {
             nb,
             host.clone(),
             "teams",
+            &[SourceKey::Teams],
             TeamsViewer::default,
             move |ctx, panel, sources, _open| {
                 let Some(view) = sources.dataset(SourceKey::Teams) else {
@@ -470,6 +511,7 @@ pub fn compose_hosted(nb: &mut NotebookCtx, target: Target, host: impl Host) {
             nb,
             host.clone(),
             "relations",
+            &[SourceKey::Relations],
             RelationsViewer::default,
             move |ctx, panel, sources, _open| {
                 let Some(view) = sources.dataset(SourceKey::Relations) else {
@@ -485,6 +527,7 @@ pub fn compose_hosted(nb: &mut NotebookCtx, target: Target, host: impl Host) {
             nb,
             host.clone(),
             "memory",
+            &[SourceKey::Memory],
             MemoryViewer::default,
             move |ctx, panel, sources, _open| {
                 let Some(view) = sources.dataset(SourceKey::Memory) else {
@@ -500,6 +543,7 @@ pub fn compose_hosted(nb: &mut NotebookCtx, target: Target, host: impl Host) {
             nb,
             host.clone(),
             "files",
+            &[SourceKey::Files],
             FilesViewer::default,
             move |ctx, panel, sources, open| {
                 let Some(view) = sources.dataset(SourceKey::Files) else {
@@ -515,6 +559,7 @@ pub fn compose_hosted(nb: &mut NotebookCtx, target: Target, host: impl Host) {
             nb,
             host.clone(),
             "diagnostics",
+            &[SourceKey::Diagnostics],
             DiagnosticsViewer::default,
             move |ctx, panel, sources, _open| {
                 let Some(cognition) = sources.dataset(SourceKey::Diagnostics) else {
@@ -542,6 +587,7 @@ pub fn compose_hosted(nb: &mut NotebookCtx, target: Target, host: impl Host) {
             nb,
             host.clone(),
             "schemas",
+            &[SourceKey::Schemas],
             SchemasViewer::default,
             move |ctx, panel, sources, _open| {
                 let Some(view) = sources.dataset(SourceKey::Schemas) else {

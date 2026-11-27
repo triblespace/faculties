@@ -27,7 +27,7 @@ use crate::schemas::posture::{EXEMPLAR_BENIGN, KIND_EXEMPLAR};
 use crate::storage::open_pile_strict;
 #[cfg(test)]
 use crate::storage::FactView;
-use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot};
+use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot, Noted};
 use anyhow::{anyhow, bail, Context, Result};
 use hifitime::Epoch;
 use lopdf::{Dictionary, Document, Object};
@@ -353,10 +353,15 @@ impl Posture {
             )
         })
     }
-    pub fn coverage(&self, scan: Option<Id>) -> Result<Option<Coverage>> {
+    /// A recorded scan's coverage, read over what is here: the notes name
+    /// each scan foundation that could not be loaded.
+    pub fn coverage(&self, scan: Option<Id>) -> Result<Noted<Option<Coverage>>> {
         self.with_operation(|storage| cmd_coverage(storage, scan.map(fmt_id)))
     }
-    pub fn scans(&self) -> Result<Vec<ScanRecord>> {
+    /// The recorded scans, read over what is here, with notes as
+    /// [`Self::coverage`] has them. No check reads this: policy, scans and
+    /// findings that gate are read completely.
+    pub fn scans(&self) -> Result<Noted<Vec<ScanRecord>>> {
         self.with_operation(cmd_scans)
     }
     pub fn vocab_add(&self, term: &str, channel: &str, why: Option<&str>) -> Result<PolicyReceipt> {
@@ -2161,16 +2166,37 @@ struct PostureStorage<'a> {
 struct CollectionView {
     facts: FactArchive,
     reader: PileSnapshot,
+    /// What a read over what is here could not load; always empty for a
+    /// complete read.
+    notes: Vec<String>,
 }
 
 impl PostureStorage<'_> {
     fn load_scope(&self, scope: Id, label: &str) -> Result<CollectionView> {
-        self.load_scopes(&[(scope, label)])?
+        self.load_scope_read(scope, label, true)
+    }
+
+    /// [`Self::load_scope`]; `complete` false answers over what is here.
+    fn load_scope_read(&self, scope: Id, label: &str, complete: bool) -> Result<CollectionView> {
+        self.load_scopes_read(&[(scope, label)], complete)?
             .pop()
             .ok_or_else(|| anyhow!("missing Posture {label} collection view"))
     }
 
+    /// Every view a check decides on is read completely: a protected term,
+    /// a scan or a settlement held in a foundation that is away must refuse
+    /// the check, not pass it.
     fn load_scopes(&self, scopes: &[(Id, &str)]) -> Result<Vec<CollectionView>> {
+        self.load_scopes_read(scopes, true)
+    }
+
+    /// `complete` refuses a read that could not load every foundation;
+    /// otherwise each view's notes name the ones it could not.
+    fn load_scopes_read(
+        &self,
+        scopes: &[(Id, &str)],
+        complete: bool,
+    ) -> Result<Vec<CollectionView>> {
         // Authority is loaded before storage is touched. Ordinary reads and
         // writes never mint an identity or substitute an ephemeral signer.
         self.storage.with_store(|store, signer, runtime| {
@@ -2230,13 +2256,22 @@ impl PostureStorage<'_> {
                     .iter()
                     .zip(rank9)
                     .map(|((_, label), collection)| {
-                        let facts = crate::storage::acquire_facts(&reader, collection)
-                            .with_context(|| {
-                                format!("read maintained Posture {label} collection")
-                            })?;
+                        let mut notes = Vec::new();
+                        let facts = if complete {
+                            crate::storage::acquire_facts(&reader, collection)
+                        } else {
+                            crate::storage::acquire_facts_noted(
+                                &reader,
+                                collection,
+                                &format!("Posture {label}"),
+                                &mut notes,
+                            )
+                        }
+                        .with_context(|| format!("read maintained Posture {label} collection"))?;
                         Ok(CollectionView {
                             facts,
                             reader: reader.clone(),
+                            notes,
                         })
                     })
                     .collect()
@@ -2293,9 +2328,10 @@ impl PostureStorage<'_> {
     }
 
     /// Scans are queried as open-world observations; publication is already
-    /// one atomic collection COMMIT by construction.
+    /// one atomic collection COMMIT by construction. Only the display of
+    /// recorded scans reads this, over what is here.
     fn scan_view(&self) -> Result<CollectionView> {
-        self.load_scope(DEFAULT_SCAN_SCOPE_ID, "scan")
+        self.load_scope_read(DEFAULT_SCAN_SCOPE_ID, "scan", false)
     }
 
     #[cfg(test)]
@@ -3601,9 +3637,19 @@ fn cmd_list(
     })
 }
 
-fn cmd_coverage(storage: PostureStorage<'_>, scan: Option<String>) -> Result<Option<Coverage>> {
+fn cmd_coverage(
+    storage: PostureStorage<'_>,
+    scan: Option<String>,
+) -> Result<Noted<Option<Coverage>>> {
     let view = storage.scan_view()?;
-    let Some(scan) = select_scan(&view.facts, scan.as_deref())? else {
+    let notes = view.notes.clone();
+    coverage_from(&view, scan.as_deref())
+        .map(|value| Noted { value, notes })
+        .map_err(|error| crate::storage::with_unread_notes(error, &view.notes))
+}
+
+fn coverage_from(view: &CollectionView, scan: Option<&str>) -> Result<Option<Coverage>> {
+    let Some(scan) = select_scan(&view.facts, scan)? else {
         return Ok(None);
     };
     // The target is part of the scan's identity, so a second target can only
@@ -3650,7 +3696,7 @@ fn cmd_coverage(storage: PostureStorage<'_>, scan: Option<String>) -> Result<Opt
     }))
 }
 
-fn cmd_scans(storage: PostureStorage<'_>) -> Result<Vec<ScanRecord>> {
+fn cmd_scans(storage: PostureStorage<'_>) -> Result<Noted<Vec<ScanRecord>>> {
     let view = storage.scan_view()?;
     let mut scans = Vec::new();
     // Target and timestamp are the scan's identity: one row per scan the
@@ -3690,15 +3736,18 @@ fn cmd_scans(storage: PostureStorage<'_>) -> Result<Vec<ScanRecord>> {
         ));
     }
     scans.sort_by(|left, right| right.cmp(left));
-    Ok(scans
-        .into_iter()
-        .map(|(created_at, id, findings, target)| ScanRecord {
-            id,
-            created_at,
-            findings,
-            target,
-        })
-        .collect())
+    Ok(Noted {
+        value: scans
+            .into_iter()
+            .map(|(created_at, id, findings, target)| ScanRecord {
+                id,
+                created_at,
+                findings,
+                target,
+            })
+            .collect(),
+        notes: view.notes,
+    })
 }
 
 // ── channels and the git audit ──────────────────────────────────────────────

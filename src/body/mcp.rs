@@ -174,12 +174,18 @@ impl Faculty for Body {
             }
             "body_list" => {
                 let _: Empty = decode_arguments(arguments)?;
-                presentation::list(&self.operations.list()?, out)
+                let list = self.operations.list()?;
+                out.notes(&list.notes)?;
+                presentation::list(&list, out)
             }
             "body_get" => {
                 let args: Id = decode_arguments(arguments)?;
                 super::validate_selector(&args.id).map_err(invalid_arguments)?;
-                let export = self.operations.get(&args.id)?;
+                let crate::storage::Noted {
+                    value: export,
+                    notes,
+                } = self.operations.get(&args.id)?;
+                out.notes(&notes)?;
                 out.line(format!(
                     "body:{:x}  {} bytes  {}",
                     export.id,
@@ -198,7 +204,9 @@ impl Faculty for Body {
                     max_dimension: args.max_dimension,
                 };
                 options.validate().map_err(invalid_arguments)?;
-                out.emit(self.operations.view(&args.id, &options)?)
+                let view = self.operations.view(&args.id, &options)?;
+                out.notes(&view.notes)?;
+                out.emit(view.value)
             }
             "body_intent_get" => {
                 let _: Empty = decode_arguments(arguments)?;

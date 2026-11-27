@@ -167,7 +167,7 @@ fn a_capture_by_file_id_stores_the_same_frame_as_by_path_and_by_bytes() {
     fixture.body().capture(&vision(image.clone())).unwrap();
     let captures = fixture.body().list().unwrap();
     assert_eq!(captures.len(), 3);
-    for capture in captures {
+    for capture in captures.value {
         let id = format!("{:x}", capture.id);
         assert_eq!(fixture.body().get(&id).unwrap().bytes, image, "{id}");
     }
@@ -209,7 +209,7 @@ fn touch_and_intent_strings_are_literal_and_read_does_not_execute_them() {
         )
     })
     .unwrap();
-    let touch = fixture.body().list().unwrap().remove(0);
+    let touch = fixture.body().list().unwrap().value.remove(0);
     assert_eq!(touch.modality, "touch");
     assert_eq!(touch.note, "@-");
     assert!(fixture

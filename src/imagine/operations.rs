@@ -485,8 +485,12 @@ impl Imagine {
         }
     }
 
-    /// Metadata only: no Secrets version is opened.
-    pub fn auth_status(&self, provider: super::auth::Provider) -> Result<super::auth::AuthStatus> {
+    /// Metadata only: no Secrets version is opened. Read over what is here,
+    /// with notes naming what could not be loaded.
+    pub fn auth_status(
+        &self,
+        provider: super::auth::Provider,
+    ) -> Result<crate::storage::Noted<super::auth::AuthStatus>> {
         super::auth::auth_status(&self.storage, provider)
     }
 

@@ -186,7 +186,7 @@ fn resident_and_path_scans_share_content_located_findings_and_coverage() {
     );
     assert_ne!(resident.scan_id, local.scan_id);
     assert_ne!(resident.files[0].path, local.files[0].path);
-    let coverage = posture.coverage(resident.scan_id).unwrap().unwrap();
+    let coverage = posture.coverage(resident.scan_id).unwrap().value.unwrap();
     assert_eq!(coverage.outcomes.get(&OUTCOME_EXAMINED), Some(&1));
     assert_eq!(coverage.outcomes.get(&DOC_UNSUPPORTED), Some(&1));
     assert_eq!(coverage.outcomes.get(&OUTCOME_PARSE_FAILED), Some(&1));
@@ -221,7 +221,7 @@ fn native_mcp_names_are_literal_and_read_frontends_agree() {
         b"sentinel is not a document input"
     );
     assert_eq!(fixture.commits(DEFAULT_SCAN_SCOPE_ID), 1);
-    let scan = fixture.operations().scans().unwrap().remove(0).id;
+    let scan = fixture.operations().scans().unwrap().value.remove(0).id;
     let scan = format!("{scan:x}");
     for (tool, args, cli_args) in [
         (
@@ -519,7 +519,7 @@ fn scans_by_file_id_and_by_path_report_what_the_byte_route_reports() {
     let id_text = scan(&by_id, &id_documents, false);
     let path_text = scan(&by_path, &path_documents, false);
     let normalized = |fixture: &Fixture, text: &str| {
-        let scan = fixture.operations().scans().unwrap().remove(0).id;
+        let scan = fixture.operations().scans().unwrap().value.remove(0).id;
         text.replace(&format!("{scan:x}"), "<scan>")
     };
     let byte_text = normalized(&by_bytes, &byte_text);
@@ -528,7 +528,7 @@ fn scans_by_file_id_and_by_path_report_what_the_byte_route_reports() {
     assert_eq!(normalized(&by_path, &path_text), byte_text, "path route");
     for fixture in [&by_id, &by_path] {
         assert_eq!(fixture.commits(DEFAULT_SCAN_SCOPE_ID), 1);
-        let scan = fixture.operations().scans().unwrap().remove(0).id;
+        let scan = fixture.operations().scans().unwrap().value.remove(0).id;
         let scan = format!("{scan:x}");
         let mcp_text = collect(|out| {
             fixture.adapter().call(
@@ -538,7 +538,7 @@ fn scans_by_file_id_and_by_path_report_what_the_byte_route_reports() {
             )
         })
         .unwrap();
-        let byte_scan = by_bytes.operations().scans().unwrap().remove(0).id;
+        let byte_scan = by_bytes.operations().scans().unwrap().value.remove(0).id;
         let byte_coverage = collect(|out| {
             by_bytes.adapter().call(
                 "posture_coverage",
@@ -573,6 +573,7 @@ fn scans_by_file_id_and_by_path_report_what_the_byte_route_reports() {
                 .operations()
                 .coverage(Some(Id::from_hex(&scan).unwrap()))
                 .unwrap()
+                .value
                 .unwrap();
             report.outcomes
         };
@@ -582,6 +583,7 @@ fn scans_by_file_id_and_by_path_report_what_the_byte_route_reports() {
                 .operations()
                 .coverage(published_bytes.scan_id)
                 .unwrap()
+                .value
                 .unwrap()
                 .outcomes
         );

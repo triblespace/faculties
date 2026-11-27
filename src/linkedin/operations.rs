@@ -132,6 +132,10 @@ pub struct ReviewReport {
     /// Count before limiting; a limit of zero intentionally displays no pairs.
     pub total: usize,
     pub pairs: Vec<ReviewPair>,
+    /// What the Relations read could not load
+    /// ([`crate::storage::unread_foundations_note`]): a candidate, or a
+    /// verdict that settled one, may be in a foundation named here.
+    pub notes: Vec<String>,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolutionReceipt {
@@ -293,14 +297,20 @@ struct RelationsStorage<'a> {
 struct RelationsView {
     facts: FactArchive,
     reader: AcquiringReader<FacultySnapshot>,
+    /// What a read over what is here could not load.
+    notes: Vec<String>,
 }
 
 impl RelationsStorage<'_> {
     /// Maintain and attach one immutable Relations view before planning. No
     /// repository workspace, branch head, CAS cell, or reopen sits between the
-    /// semantic decision and its signed collection commit.
+    /// semantic decision and its signed collection commit. `complete`
+    /// refuses a read that could not load every foundation: an import
+    /// deduplicates and a verdict decides from what it does not see.
+    /// Otherwise the view's notes name the foundations it could not load.
     fn with_store<T>(
         &self,
+        complete: bool,
         operation: impl FnOnce(
             &mut FacultyStore,
             Collection<SimpleArchive>,
@@ -340,15 +350,30 @@ impl RelationsStorage<'_> {
                     .context("freeze maintained Relations fact collection")?,
                 runtime.clone(),
             );
-            let facts = crate::storage::acquire_facts(&reader, maintained_rank9)
-                .context("read Relations Rank9 projection")?;
-            let view = RelationsView { facts, reader };
+            let mut notes = Vec::new();
+            let facts = if complete {
+                crate::storage::acquire_facts(&reader, maintained_rank9)
+            } else {
+                crate::storage::acquire_facts_noted(
+                    &reader,
+                    maintained_rank9,
+                    "Relations",
+                    &mut notes,
+                )
+            }
+            .context("read Relations Rank9 projection")?;
+            let view = RelationsView {
+                facts,
+                reader,
+                notes,
+            };
             operation(pile, collection, signer, &view, runtime)
         })
     }
 
+    /// A read over what is here, for display.
     fn with_view<T>(&self, operation: impl FnOnce(&RelationsView) -> Result<T>) -> Result<T> {
-        self.with_store(|_, _, _, view, _| operation(view))
+        self.with_store(false, |_, _, _, view, _| operation(view))
     }
 
     /// Publish at most one complete, locally constructed Relations fragment.
@@ -357,7 +382,7 @@ impl RelationsStorage<'_> {
         description: &'static str,
         operation: impl FnOnce(&RelationsView) -> Result<(Option<Fragment>, T)>,
     ) -> Result<T> {
-        self.with_store(|pile, collection, signer, view, runtime| {
+        self.with_store(true, |pile, collection, signer, view, runtime| {
             let (fragment, value) = operation(view)?;
             if let Some(mut fragment) = fragment {
                 fragment.describe_with(entity! { metadata::description: description });
@@ -1234,7 +1259,11 @@ fn review(storage: RelationsStorage<'_>, limit: usize) -> Result<ReviewReport> {
                 })
             })
             .collect::<Result<_>>()?;
-        Ok(ReviewReport { total, pairs })
+        Ok(ReviewReport {
+            total,
+            pairs,
+            notes: view.notes.clone(),
+        })
     })
 }
 
@@ -1354,6 +1383,54 @@ mod tests {
             email: email.to_owned(),
             ..Connection::default()
         }
+    }
+
+    /// A foundation of Relations is stranded on another host: the review
+    /// answers over what is here and names it, while an import, which
+    /// deduplicates against what it sees, and a verdict refuse the
+    /// incomplete read.
+    #[test]
+    fn review_reads_while_a_relations_foundation_is_away() {
+        use crate::storage::residual_fixture::{
+            refuses_incomplete, storage, strand_in, unrelated_fragment,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let storage = storage(directory.path());
+        let linkedin = LinkedIn::with_storage(storage.clone());
+        linkedin
+            .import(
+                &[connection(
+                    "Ada Lovelace",
+                    "linkedin.com/in/ada",
+                    "ada@example.org",
+                )],
+                false,
+            )
+            .unwrap();
+        let away = strand_in(&storage, DEFAULT_SCOPE_ID, unrelated_fragment());
+
+        let review = linkedin.review(10).unwrap();
+        assert!(
+            review.notes.iter().any(|note| note.contains(&away)),
+            "{:?}",
+            review.notes
+        );
+        let refused =
+            |error: anyhow::Error| assert!(refuses_incomplete(&error, &away), "{error:#}");
+        refused(
+            linkedin
+                .import(
+                    &[connection(
+                        "Alan Turing",
+                        "linkedin.com/in/alan",
+                        "alan@example.org",
+                    )],
+                    true,
+                )
+                .unwrap_err(),
+        );
+        refused(linkedin.resolve("aaaa", "bbbb", true).unwrap_err());
+        storage.close().unwrap();
     }
 
     #[test]

@@ -220,16 +220,15 @@ impl Faculty for Posture {
             }
             "posture_coverage" => {
                 let args: Coverage = decode_arguments(arguments)?;
-                presentation::coverage(
-                    self.operations
-                        .coverage(scan_id(args.scan.as_deref())?)?
-                        .as_ref(),
-                    out,
-                )
+                let coverage = self.operations.coverage(scan_id(args.scan.as_deref())?)?;
+                out.notes(&coverage.notes)?;
+                presentation::coverage(coverage.value.as_ref(), out)
             }
             "posture_scans" => {
                 let _: Empty = decode_arguments(arguments)?;
-                presentation::scans(&self.operations.scans()?, out)
+                let scans = self.operations.scans()?;
+                out.notes(&scans.notes)?;
+                presentation::scans(&scans, out)
             }
             "posture_vocab_add" => {
                 let args: Add = decode_arguments(arguments)?;

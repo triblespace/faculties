@@ -901,3 +901,40 @@ fn mcp_binds_a_secrets_version_shows_it_and_never_shows_the_key() {
     call(&adapter, serde_json::json!({"prompt": "a lantern"})).unwrap();
     assert!(server.heads()[0].contains(&format!("bearer {}", KEY.to_ascii_lowercase())));
 }
+
+/// A foundation of the Imagine collection is stranded on another host: the
+/// status answers over what is here and names it, while a generation, which
+/// selects the credential it authenticates with, and a rebinding, which
+/// supersedes the heads it saw, refuse the incomplete read; nothing is sent.
+#[test]
+fn status_reads_but_credential_selection_refuses_while_an_imagine_foundation_is_away() {
+    use crate::storage::residual_fixture::{
+        refuses_incomplete, storage, strand_in, unrelated_fragment,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let storage = storage(directory.path());
+    let server = Server::start(Reply::Json(200, fake::success(b"unused", "png")));
+    let imagine = bound(&storage, &server);
+    let away = strand_in(&storage, IMAGINE, unrelated_fragment());
+
+    let status = imagine.auth_status(Provider::OpenAi).unwrap();
+    assert!(status.selected(Provider::OpenAi).is_ok());
+    assert!(
+        status.notes.iter().any(|note| note.contains(&away)),
+        "{:?}",
+        status.notes
+    );
+    let error = imagine
+        .generate(&Request::OpenAi(openai_request("x")))
+        .unwrap_err();
+    assert!(refuses_incomplete(&error, &away), "{error:#}");
+    assert_eq!(server.count(), 0);
+    let secret = crate::secrets::Secrets::with_storage(storage.clone())
+        .add("openai-next", KEY.as_bytes())
+        .unwrap();
+    let error = imagine
+        .auth_set(Provider::OpenAi, Selector::Version(secret))
+        .unwrap_err();
+    assert!(refuses_incomplete(&error, &away), "{error:#}");
+    storage.close().unwrap();
+}

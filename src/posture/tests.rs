@@ -2203,3 +2203,49 @@ fn git_subprocess_errors_fail_closed() {
     let error = git_probe(directory.path(), &["remote", "get-url", "origin"], &[2]).unwrap_err();
     assert!(error.to_string().contains("git -C"));
 }
+
+/// A foundation is stranded on another host: the recorded scans and their
+/// coverage answer over what is here and name it, and a scan is still
+/// recorded, while every check that decides on the policy fails closed:
+/// a vocabulary foundation that is away refuses the audit and the listing
+/// of protected terms instead of passing with fewer terms.
+#[test]
+fn recorded_scans_read_but_checks_fail_closed_while_a_posture_foundation_is_away() {
+    use crate::storage::residual_fixture::{
+        refuses_incomplete, storage, strand_in, unrelated_fragment,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let storage = storage(directory.path());
+    let posture = Posture::with_storage(storage.clone());
+    let document = DocumentInput {
+        name: "note.txt",
+        bytes: b"plain words",
+    };
+    posture.scan("resident", &[document], false).unwrap();
+    let scans_away = strand_in(&storage, DEFAULT_SCAN_SCOPE_ID, unrelated_fragment());
+    let policy_away = strand_in(&storage, DEFAULT_POLICY_SCOPE_ID, unrelated_fragment());
+
+    let recorded = posture.scan("meanwhile", &[document], false).unwrap();
+    let scans = posture.scans().unwrap();
+    assert_eq!(scans.len(), 2);
+    assert!(
+        scans.notes.iter().any(|note| note.contains(&scans_away)),
+        "{:?}",
+        scans.notes
+    );
+    let coverage = posture.coverage(recorded.scan_id).unwrap();
+    assert!(coverage.value.is_some());
+    assert!(coverage.notes.iter().any(|note| note.contains(&scans_away)));
+    let error = posture.coverage(Some(genid().id)).unwrap_err();
+    assert!(format!("{error:#}").contains(&scans_away), "{error:#}");
+
+    let refused =
+        |error: anyhow::Error| assert!(refuses_incomplete(&error, &policy_away), "{error:#}");
+    refused(posture.vocab_list(None).unwrap_err());
+    refused(
+        posture
+            .git(directory.path(), &["HEAD".to_owned()], "github-public")
+            .unwrap_err(),
+    );
+    storage.close().unwrap();
+}

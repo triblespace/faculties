@@ -31,7 +31,9 @@ use crate::storage::{AcquiringReader, FacultyStore};
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result};
-use triblespace::core::collection::{Collection, CollectionSnapshotExt, CollectionStoreExt};
+use triblespace::core::collection::{
+    Collection, CollectionSnapshotExt, CollectionStoreExt, Support,
+};
 use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
 use triblespace::prelude::blobencodings::SimpleArchive;
 use triblespace::prelude::*;
@@ -40,7 +42,8 @@ use triblespace_search::text_bm25::{Bm25Tokenizer, TextAttributeToBm25};
 use triblespace_search::tokens::{code_tokens, WordHash};
 
 use crate::code::operations::{
-    hit, keeps, placements_of_item, provenance, select_scans, Code, Filter, Hit, Provenance, Texts,
+    hit, keeps, placements_of_item, provenance, read_facts, read_notes, select_scans, Code, Filter,
+    Hit, Provenance, Texts,
 };
 use crate::code::TextHandle;
 use crate::schemas::code::{attrs, DEFAULT_SCOPE_ID};
@@ -80,11 +83,15 @@ impl Tier {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct IndexReport {
     pub doc_documents: usize,
     pub text_documents: usize,
     pub source_elements: usize,
+    /// The foundations each cover could not read
+    /// ([`crate::storage::unread_foundations_note`]): their documents are
+    /// not in the counts above.
+    pub notes: Vec<String>,
 }
 
 /// One file's worth of hits, ranked as a group.
@@ -163,29 +170,41 @@ impl Code {
             })?;
             let doc_snapshot = AcquiringReader::new(doc_snapshot, runtime.clone());
             let text_snapshot = AcquiringReader::new(text_snapshot, runtime.clone());
-            let doc_documents = crate::storage::require_complete_attached_read(
-                doc_snapshot
-                    .attached_acquiring(doc_target)?
-                    .read_acquiring::<CodeBM25View>()?,
-            )?
-            .segments()
-            .iter()
-            .map(|index| index.doc_count())
-            .sum();
-            let text_documents = crate::storage::require_complete_attached_read(
-                text_snapshot
-                    .attached_acquiring(text_target)?
-                    .read_acquiring::<CodeBM25View>()?,
-            )?
-            .segments()
-            .iter()
-            .map(|index| index.doc_count())
-            .sum();
+            // Counted over what each cover could read; the notes name the
+            // rest. Maintenance above is what writes the covers.
+            let mut notes = Vec::new();
+            let (doc_view, doc_unread) = doc_snapshot
+                .attached_acquiring(doc_target)?
+                .read_acquiring::<CodeBM25View>()?
+                .into_parts();
+            notes.extend(crate::storage::unread_foundations_note(
+                "Code (prose index)",
+                &doc_unread,
+            ));
+            let doc_documents = doc_view
+                .segments()
+                .iter()
+                .map(|index| index.doc_count())
+                .sum();
+            let (text_view, text_unread) = text_snapshot
+                .attached_acquiring(text_target)?
+                .read_acquiring::<CodeBM25View>()?
+                .into_parts();
+            notes.extend(crate::storage::unread_foundations_note(
+                "Code (token index)",
+                &text_unread,
+            ));
+            let text_documents = text_view
+                .segments()
+                .iter()
+                .map(|index| index.doc_count())
+                .sum();
             let source_elements = text_snapshot.collection(source)?.support()?.len();
             Ok(IndexReport {
                 doc_documents,
                 text_documents,
                 source_elements,
+                notes,
             })
         })
     }
@@ -214,9 +233,10 @@ impl Code {
         top: usize,
         filter: &Filter,
     ) -> Result<SearchReport> {
-        let text_scores = self.bm25_scores(query, tier)?;
+        let (text_scores, index_unread) = self.bm25_scores(query, tier)?;
         let observed = self.observe()?;
-        let facts = crate::storage::acquire_attached_facts(&observed).context("read Code facts")?;
+        let (facts, unread) = read_facts(&observed)?;
+        let notes = read_notes(&unread, &index_unread);
         let scores = entity_scores(&facts, &text_scores);
         let reader = observed.snapshot();
         let mut texts = Texts::new(reader);
@@ -224,7 +244,7 @@ impl Code {
 
         let mut report = SearchReport {
             query: query.to_owned(),
-            provenance: provenance(&facts, &scans),
+            provenance: provenance(&facts, &scans, &notes),
             ..SearchReport::default()
         };
         if scores.is_empty() {
@@ -318,7 +338,7 @@ cover is behind them: run `code index`."
 impl Code {
     /// Weighted scores per text. The join to entities happens in the caller,
     /// over the fact archive it already holds for placing the hits.
-    fn bm25_scores(&self, query: &str, tier: Tier) -> Result<TextScores> {
+    fn bm25_scores(&self, query: &str, tier: Tier) -> Result<(TextScores, Vec<Support>)> {
         let targets = self.lexical_targets()?;
         self.storage().with_store(|store, _, runtime| {
             let reader = AcquiringReader::new(store.snapshot()?, runtime.clone());
@@ -344,23 +364,25 @@ impl Code {
     }
 }
 
-/// Score existing covers on the same frozen reader used for placements/facts.
+/// Score existing covers on the same frozen reader used for placements/facts,
+/// over what each cover could read; beside the scores, the foundations each
+/// could not ([`read_notes`] names them).
 pub(crate) fn score_texts(
     reader: &crate::code::operations::CodeReader,
     targets: [Collection<PortableBM25Blob>; 2],
     query: &str,
     tier: Tier,
-) -> Result<TextScores> {
+) -> Result<(TextScores, Vec<Support>)> {
     let terms = code_tokens(query);
     let mut scores = TextScores::default();
-    let accumulate = |target: Collection<PortableBM25Blob>,
-                      weight: f32,
-                      scores: &mut BTreeMap<TextHandle, f32>|
+    let mut unread = Vec::new();
+    let mut accumulate = |target: Collection<PortableBM25Blob>,
+                          weight: f32,
+                          scores: &mut BTreeMap<TextHandle, f32>|
      -> Result<()> {
         let attached = reader.attached_acquiring(target)?;
-        let view = crate::storage::require_complete_attached_read(
-            attached.read_acquiring::<CodeBM25View>()?,
-        )?;
+        let (view, missed) = attached.read_acquiring::<CodeBM25View>()?.into_parts();
+        unread.push(missed);
         let query = view.query().context("prepare Code BM25 query")?;
         for (document, score) in query.query_multi(&terms).context("score Code BM25 query")? {
             *scores.entry(document).or_insert(0.0) += score * weight;
@@ -373,7 +395,7 @@ pub(crate) fn score_texts(
     if matches!(tier, Tier::Text | Tier::Both) {
         accumulate(targets[1], 0.5, &mut scores.source_tokens)?;
     }
-    Ok(scores)
+    Ok((scores, unread))
 }
 
 /// Keep the two lexical reasons independent until a caller chooses presentation.

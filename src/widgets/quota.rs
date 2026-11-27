@@ -259,6 +259,12 @@ impl QuotaViewer {
             ui.label("Current time unavailable.");
             return;
         };
+        // A read that could not load every foundation still shows what is
+        // here, and says what it omits.
+        let notes = sources.notes(SourceKey::Quota);
+        for note in notes {
+            ui.small(format!("Showing what is here: {note}"));
+        }
         ui.horizontal(|ui| {
             ui.label("History");
             for (index, (_, label)) in RANGES.iter().enumerate() {
@@ -294,7 +300,7 @@ impl QuotaViewer {
         );
         match result.as_ref().filter(|(cached, _)| *cached == key) {
             Some((_, Projection::Ready(history))) if history.allowances.is_empty() => {
-                ui.label("No quota observations in this range.");
+                ui.label(empty_range_message(notes));
             }
             Some((_, Projection::Ready(history))) => draw_history(
                 ui,
@@ -315,6 +321,16 @@ impl QuotaViewer {
                 ui.label("Loading quota history…");
             }
         }
+    }
+}
+
+/// An empty range over a complete read is empty; over a partial one it is
+/// only empty here.
+fn empty_range_message(notes: &[String]) -> &'static str {
+    if notes.is_empty() {
+        "No quota observations in this range."
+    } else {
+        "No quota observations here in this range; some could not be loaded."
     }
 }
 

@@ -199,10 +199,16 @@ pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
             out,
         ),
         Some(Command::List) => {
-            presentation::list(&storage(&cli.workspace, cli.pile, cli.key)?.list()?, out)
+            let list = storage(&cli.workspace, cli.pile, cli.key)?.list()?;
+            out.notes(&list.notes)?;
+            presentation::list(&list, out)
         }
         Some(Command::Get { id, output }) => {
-            let export = storage(&cli.workspace, cli.pile, cli.key)?.get(&id)?;
+            let crate::storage::Noted {
+                value: export,
+                notes,
+            } = storage(&cli.workspace, cli.pile, cli.key)?.get(&id)?;
+            out.notes(&notes)?;
             if output.as_deref() == Some("@-") {
                 let uri = export.uri();
                 out.blob(export.bytes, "application/octet-stream", uri)

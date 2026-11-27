@@ -95,6 +95,7 @@ pub fn person(value: &ReviewPerson, out: &mut Out<'_>) -> Result<()> {
 }
 
 pub fn review(value: &ReviewReport, out: &mut Out<'_>) -> Result<()> {
+    out.notes(&value.notes)?;
     if value.total == 0 {
         return out.line("No open review candidates. 🎉");
     }

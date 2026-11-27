@@ -294,3 +294,98 @@ fn cli_and_mcp_share_candidate_scope_and_source_output() {
     assert!(cli_text.contains("sensor::pulse();"));
     assert!(cli_text.contains("Candidate evidence only"));
 }
+
+/// A foundation of the Code collection is stranded on another host: the
+/// questions answer over what is here and name it in their provenance, a
+/// miss carries the note, and the operations that decide from what they do
+/// not see refuse: an ingest skips what it believes already catalogued and
+/// a share sends only an unambiguous match.
+#[test]
+fn questions_answer_while_a_code_foundation_is_away() {
+    use crate::code::share::ShareRequest;
+    use crate::storage::residual_fixture::{
+        refuses_incomplete, storage, strand_in, unrelated_fragment,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let storage = storage(directory.path());
+    let code = Code::with_storage(storage.clone());
+    let dir = directory.path().join("repo");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("lib.rs"), SEED).unwrap();
+    code_git::initialize(&dir);
+    code.ingest(&[dir.clone()], &IngestOptions::default())
+        .unwrap();
+    code.index().unwrap();
+    let away = strand_in(&storage, DEFAULT_SCOPE_ID, unrelated_fragment());
+    let named = |notes: &[String]| notes.iter().any(|note| note.contains(&away));
+
+    let found = code.find("seed", &Filter::default()).unwrap();
+    assert_eq!(found.hits.len(), 1);
+    assert!(
+        named(&found.provenance.notes),
+        "{:?}",
+        found.provenance.notes
+    );
+    let seed = found.hits[0].item;
+    assert!(named(
+        &code
+            .uses("sensor", &Filter::default())
+            .unwrap()
+            .provenance
+            .notes
+    ));
+    assert!(named(
+        &code.stats(&Filter::default()).unwrap().provenance.notes
+    ));
+    assert!(named(
+        &code
+            .duplicates(1, false, &Filter::default())
+            .unwrap()
+            .provenance
+            .notes
+    ));
+    assert!(named(&code.show("seed", false).unwrap().provenance.notes));
+    let error = code.show("nowhere_defined", false).unwrap_err();
+    assert!(format!("{error:#}").contains(&away), "{error:#}");
+    let searched = code
+        .search("stellar telemetry", Tier::Both, 5, &Filter::default())
+        .unwrap();
+    assert!(named(&searched.provenance.notes));
+    assert!(named(
+        &code
+            .candidates(seed, 5, false, &Filter::default())
+            .unwrap()
+            .provenance
+            .notes
+    ));
+
+    let refused = |error: anyhow::Error| assert!(refuses_incomplete(&error, &away), "{error:#}");
+    fs::write(dir.join("more.rs"), "pub fn more() {}\n").unwrap();
+    refused(
+        code.ingest(&[dir.clone()], &IngestOptions::default())
+            .unwrap_err(),
+    );
+    refused(
+        code.share_plan(&ShareRequest {
+            selector: "seed".to_owned(),
+            filter: Filter::default(),
+            path: None,
+            lines: None,
+            note: None,
+        })
+        .unwrap_err(),
+    );
+    storage.close().unwrap();
+}
+
+#[test]
+fn a_malformed_code_foundation_fails_loudly() {
+    use crate::storage::residual_fixture::{is_fault, malformed_in, storage};
+    let directory = tempfile::tempdir().unwrap();
+    let storage = storage(directory.path());
+    let code = Code::with_storage(storage.clone());
+    malformed_in(&storage, DEFAULT_SCOPE_ID);
+    let error = code.find("seed", &Filter::default()).unwrap_err();
+    assert!(is_fault(&error), "{error:#}");
+    storage.close().unwrap();
+}

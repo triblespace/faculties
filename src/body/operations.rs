@@ -11,7 +11,7 @@ use crate::schemas::body::{capture, DEFAULT_SCOPE_ID, KIND_CAPTURE, KIND_INTENT}
 #[cfg(test)]
 use crate::storage::FactRead;
 use crate::storage::{AcquiringReader, FacultySnapshot};
-use crate::storage::{FactArchive, Storage};
+use crate::storage::{FactArchive, Noted, Storage};
 use anybytes::Bytes;
 use anyhow::{bail, Context, Result};
 use hifitime::Epoch;
@@ -167,12 +167,16 @@ impl Body {
         })
     }
 
+    /// The current intent, read completely: it is the instruction a
+    /// controller acts on, and a newer one held in a foundation that is away
+    /// would leave a superseded instruction standing.
     pub fn intent(&self) -> Result<Option<IntentObservation>> {
         self.storage().with_indexed_view(latest_intent)
     }
 
-    /// Notes only: this does not acquire frame or pose payloads.
-    pub fn list(&self) -> Result<Vec<CaptureSummary>> {
+    /// Notes only: this does not acquire frame or pose payloads. Read over
+    /// what is here; the notes name each foundation that could not be loaded.
+    pub fn list(&self) -> Result<Noted<Vec<CaptureSummary>>> {
         self.storage().with_view(|space, reader| {
             let mut rows = Vec::new();
             for (id, modality, created) in find!(
@@ -200,7 +204,9 @@ impl Body {
 
     /// Exact original bytes, never a perception. A touch has no file payload.
     /// The selected capture/frame and reader stay in one frozen observation.
-    pub fn get(&self, id: &str) -> Result<CaptureExport> {
+    /// Read over what is here: a capture not found may be in a foundation the
+    /// notes name.
+    pub fn get(&self, id: &str) -> Result<Noted<CaptureExport>> {
         validate_selector(id)?;
         self.storage().with_view(|space, reader| {
             let ids = find!(c: Id, pattern!(space, [{ ?c @ metadata::tag: KIND_CAPTURE }]));
@@ -233,14 +239,21 @@ impl Body {
 
     /// Bounded derived perception through the shared Files presenter. Original
     /// bytes remain unchanged; unsupported media returns an explicit error.
-    pub fn view(&self, id: &str, options: &ViewOptions) -> Result<Part> {
+    pub fn view(&self, id: &str, options: &ViewOptions) -> Result<Noted<Part>> {
         options.validate()?;
-        let export = self.get(id)?;
+        let Noted {
+            value: export,
+            notes,
+        } = self.get(id)?;
         let mime = export
             .mime
             .as_deref()
-            .context("capture has no MIME type; use get for original bytes")?;
-        present(export.bytes, mime, options)
+            .context("capture has no MIME type; use get for original bytes")
+            .map_err(|error| crate::storage::with_unread_notes(error, &notes))?;
+        Ok(Noted {
+            value: present(export.bytes, mime, options)?,
+            notes,
+        })
     }
 }
 
@@ -370,10 +383,12 @@ impl BodyStorage<'_> {
         })
     }
 
+    /// One read over what is here: the answer, with notes naming each
+    /// foundation that could not be loaded; a failure carries them too.
     fn with_view<T>(
         &self,
         f: impl FnOnce(&FactArchive, &AcquiringReader<FacultySnapshot>) -> Result<T>,
-    ) -> Result<T> {
+    ) -> Result<Noted<T>> {
         self.storage.with_store(|pile, signer, runtime| {
             let source = self.storage.open_collection_read(
                 pile,
@@ -388,9 +403,17 @@ impl BodyStorage<'_> {
                 pile.snapshot().context("freeze Body fact collection")?,
                 runtime.clone(),
             );
-            let facts = crate::storage::acquire_facts(&store_snapshot, collection_rank9)
-                .context("read maintained Body fact collection")?;
-            f(&facts, &store_snapshot)
+            let mut notes = Vec::new();
+            let facts = crate::storage::acquire_facts_noted(
+                &store_snapshot,
+                collection_rank9,
+                "Body",
+                &mut notes,
+            )
+            .context("read maintained Body fact collection")?;
+            let value = f(&facts, &store_snapshot)
+                .map_err(|error| crate::storage::with_unread_notes(error, &notes))?;
+            Ok(Noted { value, notes })
         })
     }
 
@@ -492,5 +515,57 @@ mod projection_tests {
             .unwrap();
         assert_eq!(winners.winner(KIND_INTENT), Some(intent.id));
         pile.close().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod residual_tests {
+    use super::*;
+    use crate::storage::residual_fixture::{
+        is_fault, malformed_in, refuses_incomplete, storage, strand_in, unrelated_fragment,
+    };
+
+    fn touch(note: &str) -> CaptureInput {
+        CaptureInput {
+            signal: Signal::Touch,
+            pose: "pose".to_owned(),
+            note: Some(note.to_owned()),
+        }
+    }
+
+    /// A foundation of the Body collection is stranded on another host:
+    /// captures and intents are still written, the capture list answers over
+    /// what is here and names it, a capture not found carries the note, and
+    /// the current intent, the instruction a controller acts on, refuses.
+    #[test]
+    fn captures_go_on_while_a_body_foundation_is_away() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = storage(directory.path());
+        let body = Body::with_storage(storage.clone());
+        body.capture(&touch("resident")).unwrap();
+        let away = strand_in(&storage, DEFAULT_SCOPE_ID, unrelated_fragment());
+        let named = |notes: &[String]| notes.iter().any(|note| note.contains(&away));
+
+        body.capture(&touch("meanwhile")).unwrap();
+        body.set_intent("look left").unwrap();
+        let listed = body.list().unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(named(&listed.notes), "{:?}", listed.notes);
+        let error = body.get("abcdef").unwrap_err();
+        assert!(format!("{error:#}").contains(&away), "{error:#}");
+        let error = body.intent().unwrap_err();
+        assert!(refuses_incomplete(&error, &away), "{error:#}");
+        storage.close().unwrap();
+    }
+
+    #[test]
+    fn a_malformed_body_foundation_fails_loudly() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = storage(directory.path());
+        let body = Body::with_storage(storage.clone());
+        malformed_in(&storage, DEFAULT_SCOPE_ID);
+        let error = body.list().unwrap_err();
+        assert!(is_fault(&error), "{error:#}");
+        storage.close().unwrap();
     }
 }

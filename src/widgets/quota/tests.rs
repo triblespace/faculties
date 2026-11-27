@@ -531,3 +531,79 @@ fn frame_containing(target: Target, observation: WorkspaceObservation, expected:
         std::thread::sleep(Duration::from_millis(10));
     }
 }
+
+/// A commit whose payload is not here: the routed Quota view still shows
+/// the resident readings and names the missing foundation, and a range that
+/// holds nothing resident is not presented as an empty history.
+#[test]
+fn a_stranded_foundation_shows_what_is_here_and_never_an_empty_history() {
+    use triblespace::core::collection::{
+        empty_metadata_handle, CollectionCommit, CollectionRecord, CollectionStore,
+    };
+    use triblespace::prelude::inlineencodings::Handle;
+
+    fn strand(
+        pile: &mut Pile,
+        signer: &SigningKey,
+        collection: Collection<blobencodings::SimpleArchive>,
+    ) -> String {
+        let withheld: Blob<blobencodings::SimpleArchive> =
+            observation_fragment(&reading("withheld-digest", 1_790_000_000, 12.0))
+                .unwrap()
+                .0
+                .into_facts()
+                .to_blob();
+        pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
+            signer,
+            collection.handle(),
+            Handle::<blobencodings::SimpleArchive>::to_hash(withheld.get_handle()),
+            empty_metadata_handle(),
+        )))
+        .unwrap();
+        hex::encode(withheld.get_handle().raw)
+    }
+
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let signer = SigningKey::from_bytes(&[51; 32]);
+    let mut pile = Pile::open_as(file.path(), signer.verifying_key()).unwrap();
+    let now = tai_ns_to_unix(crate::clock::tai_nanoseconds_now().unwrap());
+    let collection = pile.collection("quota", open()).unwrap();
+    publish(
+        &mut pile,
+        &signer,
+        collection,
+        reading("resident-digest", now - 240, 33.0),
+    );
+    let away = strand(&mut pile, &signer, collection);
+    let observed = observe(&mut pile, &signer, Some(collection));
+    let context = observed.loaded_context();
+    assert!(!context.missing_route(SourceKey::Quota));
+    let view = context.dataset(SourceKey::Quota).unwrap();
+    assert!(
+        view.notes.iter().any(|note| note.contains(&away)),
+        "{:?}",
+        view.notes
+    );
+    assert!(observed.partial_notes().any(|note| note.contains(&away)));
+    let Projection::Ready(history) = project(view, unix_to_tai_ns(now), DAY) else {
+        panic!("the resident reading should be readable");
+    };
+    assert_eq!(history.allowances.len(), 1);
+    let frame = frame_containing(Target::Quota, observed, "Showing what is here");
+    assert!(frame.text.iter().any(|text| text.contains(&away)));
+
+    let lonely = pile.collection("stranded-quota-fixture", open()).unwrap();
+    let away = strand(&mut pile, &signer, lonely);
+    let observed = observe(&mut pile, &signer, Some(lonely));
+    let frame = frame_containing(
+        Target::Quota,
+        observed,
+        "No quota observations here in this range; some could not be loaded.",
+    );
+    assert!(frame.text.iter().any(|text| text.contains(&away)));
+    assert!(!frame
+        .text
+        .iter()
+        .any(|text| text == "No quota observations in this range."));
+    pile.close().unwrap();
+}

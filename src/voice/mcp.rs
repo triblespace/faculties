@@ -124,7 +124,9 @@ impl Faculty for Voice {
             }
             "voice_route" => {
                 let _: Empty = decode_arguments(arguments)?;
-                for policy in self.operations.routes()? {
+                let routes = self.operations.routes()?;
+                out.notes(&routes.notes)?;
+                for policy in routes.value {
                     out.line(format!(
                         "{} policy (priority order): {}",
                         policy.channel.name(),

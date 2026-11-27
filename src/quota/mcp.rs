@@ -98,11 +98,13 @@ impl Faculty for Quota {
             "quota_history" => {
                 let args: HistoryArguments = decode_arguments(arguments)?;
                 let view = self.operations.history(args.since, args.until)?;
+                output.notes(&view.notes)?;
                 super::history::show_json(&view, output)
             }
             "quota_show" => {
                 let args: ShowArguments = decode_arguments(arguments)?;
-                let view = self.operations.show()?;
+                let view = self.operations.show_read()?;
+                output.notes(&view.notes)?;
                 if args.json {
                     render::show_json(&view, output)
                 } else {
