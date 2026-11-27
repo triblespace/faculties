@@ -30,6 +30,7 @@ impl Target {
             Self::Teams => &[SourceKey::Teams],
             Self::Diagnostics => &[SourceKey::Diagnostics],
             Self::Rules => &crate::widgets::rules::INPUTS,
+            Self::Quota => &[SourceKey::Quota],
         }
     }
 }
@@ -254,6 +255,16 @@ pub fn compose_hosted(nb: &mut NotebookCtx, target: Target, host: impl Host) {
             |ctx, panel, sources, _| {
                 panel.render(ctx, sources);
             },
+        );
+    }
+
+    if target == Target::Dashboard || target == Target::Quota {
+        card(
+            nb,
+            host.clone(),
+            "quota",
+            crate::widgets::QuotaViewer::default,
+            |ctx, panel, sources, _| panel.render(ctx, sources),
         );
     }
 
@@ -670,6 +681,7 @@ mod tests {
             (Target::Events, SourceKey::Events),
             (Target::Teams, SourceKey::Teams),
             (Target::Diagnostics, SourceKey::Diagnostics),
+            (Target::Quota, SourceKey::Quota),
         ] {
             assert_eq!(target.sources(), &[source]);
         }

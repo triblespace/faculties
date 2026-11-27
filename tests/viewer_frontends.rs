@@ -27,14 +27,14 @@ fn tiny_page() -> CapturePage {
 
 #[test]
 fn target_inventory_and_original_dashboard_order_are_explicit() {
-    assert_eq!(Target::ALL.len(), 13);
+    assert_eq!(Target::ALL.len(), 14);
     assert_eq!(
         Target::ALL
             .into_iter()
             .map(Target::name)
             .collect::<BTreeSet<_>>()
             .len(),
-        13
+        14
     );
     assert_eq!(
         Target::Dashboard.card_names(),
@@ -43,10 +43,12 @@ fn target_inventory_and_original_dashboard_order_are_explicit() {
             "profiles",
             "colony",
             "rules",
+            "quota",
             "timeline",
             "knowledge-health",
             "knowledge",
             "goals",
+            "priority-game",
             "decisions",
             "mail",
             "events",
@@ -77,6 +79,140 @@ fn target_inventory_and_original_dashboard_order_are_explicit() {
         .collect();
     assert_eq!(targets, Target::ALL.into_iter().map(Target::name).collect());
     assert_eq!(schema["required"], serde_json::json!(["target"]));
+}
+
+#[test]
+#[cfg(feature = "widgets")]
+fn dashboard_capture_labels_follow_rendered_card_order() {
+    use faculties::storage::Storage;
+    use faculties::viewer::{compose_hosted, Host, HostAction};
+    use faculties::widgets::{SourceKey, StorageState, WidgetContext};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use GORBIE::prelude::CardCtx;
+
+    fn text(shape: &egui::epaint::Shape, output: &mut Vec<String>) {
+        match shape {
+            egui::epaint::Shape::Text(t) => output.push(t.galley.text().to_owned()),
+            egui::epaint::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    text(shape, output);
+                }
+            }
+            _ => {}
+        }
+    }
+    #[derive(Clone)]
+    struct RecordingHost {
+        storage: Rc<RefCell<StorageState>>,
+        // One layout frame's output only, cleared when composing the next.
+        cards: Rc<RefCell<Vec<Vec<String>>>>,
+    }
+    impl Host for RecordingHost {
+        fn with_context(
+            &self,
+            ctx: &mut CardCtx<'_>,
+            render: impl FnOnce(
+                &mut CardCtx<'_>,
+                WidgetContext<'_>,
+                u64,
+                &mut dyn FnMut(HostAction) -> Result<(), String>,
+            ),
+        ) {
+            ctx.set_default_section_open(false);
+            let painter = ctx.ui_mut().painter().clone();
+            let mut before = 0;
+            painter.for_each_shape(|_| before += 1);
+            render(ctx, self.storage.borrow().loaded_context(), 0, &mut |_| {
+                panic!("collapsed capture labels must not request an action")
+            });
+            let mut index = 0;
+            let mut labels = Vec::new();
+            painter.for_each_shape(|shape| {
+                if index >= before {
+                    text(&shape.shape, &mut labels);
+                }
+                index += 1;
+            });
+            self.cards.borrow_mut().push(labels);
+        }
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let pile = directory.path().join("capture-labels.pile");
+    let key = directory.path().join("capture-labels.key");
+    std::fs::File::create(&pile).unwrap();
+    faculties::storage::initialize_signer(&pile, Some(&key)).unwrap();
+    let mut state = StorageState::with_storage(
+        Storage::new(pile, Some(key)),
+        [SourceKey::Goals, SourceKey::Decisions, SourceKey::Schemas],
+    );
+    for source in [SourceKey::Goals, SourceKey::Decisions, SourceKey::Schemas] {
+        assert!(state.context().dataset(source).is_some(), "{source:?}");
+    }
+    let cards = Rc::new(RefCell::new(Vec::new()));
+    let host = RecordingHost {
+        storage: Rc::new(RefCell::new(state)),
+        cards: cards.clone(),
+    };
+    let ctx = egui::Context::default();
+    let mut notebook = GORBIE::NotebookConfig::new("Capture labels")
+        .without_editor()
+        .embedded(&ctx, move |nb| {
+            host.cards.borrow_mut().clear();
+            // Hosted composition owns every subsequent card; storage/selector
+            // occupies index zero, as in both actual dashboard hosts.
+            nb.view(|ctx| {
+                ctx.ui_mut().label("Storage");
+            });
+            compose_hosted(nb, Target::Dashboard, host.clone());
+        });
+    ctx.style_mut(|style| style.animation_time = 0.0);
+    let _ = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1100.0, 1600.0),
+            )),
+            ..Default::default()
+        },
+        |ui| notebook.show(ui, None),
+    );
+
+    let cards = cards.borrow();
+    assert_eq!(cards.len() + 1, Target::Dashboard.card_names().len());
+    for (title, name) in [
+        ("Quota", "quota"),
+        ("Goals", "goals"),
+        ("Priority game", "priority-game"),
+        ("Decisions", "decisions"),
+        ("Schemas", "schemas"),
+    ] {
+        let matches: Vec<_> = cards
+            .iter()
+            .enumerate()
+            .filter(|(_, labels)| labels.iter().any(|label| label == title))
+            .collect();
+        assert_eq!(matches.len(), 1, "{title}: {cards:?}");
+        let mut page = tiny_page();
+        page.card_index = matches[0].0 + 1;
+        let mut parts = Vec::new();
+        page.emit(
+            Target::Dashboard,
+            &mut Out::new(&mut |part| {
+                parts.push(part);
+                Ok(())
+            }),
+        )
+        .unwrap();
+        let Part::Text { text } = &parts[0] else {
+            panic!("missing metadata")
+        };
+        let emitted: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(emitted["card"], name, "{title}: {emitted}");
+    }
+    // This is real CPU card composition/layout plus metadata emission. The
+    // tiny PNG is synthetic; no native screenshot/GPU rendering is claimed.
 }
 
 #[test]
