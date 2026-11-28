@@ -3619,7 +3619,12 @@ impl Spawn {
             match std::fs::metadata(&path) {
                 Ok(metadata) if metadata.is_file() => return Ok(Some(path)),
                 Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                // An entry that isn't a directory (a stray .DS_Store) is no project.
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) => {}
                 Err(error) => {
                     return Err(error).with_context(|| format!("read {}", path.display()))
                 }
@@ -7330,6 +7335,22 @@ mod tests {
         let calibration = cover.calibration.unwrap();
         assert_eq!(calibration.n, None);
         assert_eq!(calibration.chars_per_token, cover::DEFAULT_CHARS_PER_TOKEN);
+    }
+
+    #[test]
+    fn a_stray_file_among_claude_projects_is_not_a_project() {
+        // A copied .DS_Store beside the project directories once failed every
+        // settle's session search with "Not a directory". A session that is in
+        // no project is simply not found, and the search walks every entry.
+        let f = fixture();
+        let projects = f.directory.path().join("claude-projects");
+        std::fs::create_dir_all(projects.join("-lane")).unwrap();
+        std::fs::write(projects.join(".DS_Store"), b"x").unwrap();
+        let found = f
+            .spawn
+            .claude_session_search("e0bf4238-7a93-4604-be3f-a4ddb456d86b")
+            .unwrap();
+        assert_eq!(found, None);
     }
 
     #[test]
