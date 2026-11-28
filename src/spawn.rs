@@ -473,10 +473,18 @@ pub fn settlement_fragment(
 }
 
 /// The fixed preamble that tells a zooid who it is.
-pub fn preamble(name: &str, spawner: &str, local: bool) -> String {
+/// `wake_by_files`: its wake is not above but in files it reads
+/// ([`wake_files`]).
+pub fn preamble(name: &str, spawner: &str, local: bool, wake_by_files: bool) -> String {
     if local {
         return local_preamble(name, spawner);
     }
+    let wake = if wake_by_files {
+        "Your wake is the shared self, its memories recalled with this brief in mind: it is in \
+         the files named under # Wake below, and you read all of it before anything else."
+    } else {
+        "The wake above is the shared self, its memories recalled with this brief in mind."
+    };
     format!(
         "You are {name}, a task zooid of this colony, spawned by {spawner} to do the one task in the \
          brief below. Your name is your persona: PERSONA is set to it, and your faculty writes \
@@ -489,8 +497,7 @@ pub fn preamble(name: &str, spawner: &str, local: bool) -> String {
          `persona`, `by` or `reader`. Your name is also an address: {spawner} or another zooid \
          may message you while you work. On a longer task, check between steps with \
          `orient_poll` (persona {name}, peek true), answer with `message_send` from {name}, and \
-         `message_ack` what you have handled. The wake above is the shared self, its memories \
-         recalled with this brief in mind.\n"
+         `message_ack` what you have handled. {wake}\n"
     )
 }
 
@@ -829,6 +836,10 @@ pub struct ScriptFacts<'a> {
     /// (the prompt, then news between turns) through a pipe instead of from
     /// the prompt file. The feeder runs with the real home.
     pub feed: bool,
+    /// Pass the prompt file's contents as one command-line argument prefixed
+    /// by this string (for agy's `--print=`), instead of redirecting it on
+    /// stdin. Stdin is bound to `/dev/null`.
+    pub prompt_arg: Option<&'a str>,
 }
 
 /// The unit's script. Run without arguments it is the zooid: the agent on
@@ -944,6 +955,23 @@ pub fn unit_script(facts: &ScriptFacts<'_>) -> String {
             q(facts.name),
             facts.run,
             q(facts.log)
+        ));
+    } else if let Some(prefix) = facts.prompt_arg {
+        // Read the prompt file verbatim (preserving trailing newlines) into
+        // one argument prefixed with `prefix` (e.g. `--print=`), and bind
+        // stdin to /dev/null. Fails with 78 if the prompt file cannot open.
+        let report = if facts.stdout_is_report {
+            format!(" > {}", q(facts.report))
+        } else {
+            String::new()
+        };
+        script.push_str(&format!(
+            "exec 3< {} || exit 78\n\
+             IFS= read -r -d '' _prompt <&3 || true\n\
+             exec 3<&-\n\
+             exec {agent} {}\"$_prompt\" < /dev/null{report}\n",
+            q(facts.prompt),
+            q(prefix)
         ));
     } else if facts.stdout_is_report {
         script.push_str(&format!(
@@ -1061,7 +1089,7 @@ mod tests {
 
     #[test]
     fn the_preamble_names_the_zooid_as_an_address_it_polls() {
-        let text = preamble("lusab-babad", "tutor", false);
+        let text = preamble("lusab-babad", "tutor", false, false);
         // Writes are attributed by name, and the name is also its inbox.
         assert!(text.contains(
             "pass lusab-babad wherever a write tool takes `from`, `persona`, `by` or `reader`"
@@ -1071,11 +1099,14 @@ mod tests {
         assert!(text.contains("Your final reply is your report"));
         assert!(text.contains("faculties MCP tools"));
         assert!(!text.contains("despawn"));
+        let by_files = preamble("lusab-babad", "tutor", false, true);
+        assert!(by_files.contains("files named under # Wake below"));
+        assert!(!by_files.contains("The wake above"));
     }
 
     #[test]
     fn a_local_zooid_is_told_she_lives_in_drive_and_is_stopped_by_the_host() {
-        let text = preamble("lusab-babad", "tutor", true);
+        let text = preamble("lusab-babad", "tutor", true, false);
         assert!(text.contains("You live in Drive's loop on this host; the host stops you."));
         assert!(text.contains("you can be resumed into your own history"));
         assert!(text.contains("The brief is where you start, not a fence"));
@@ -1273,6 +1304,7 @@ mod tests {
             faculties: "/b/faculties",
             home: None,
             feed: false,
+            prompt_arg: None,
         });
         assert!(script.contains("set -a; . /c/colony.env || exit 78; set +a\n"));
         assert!(script.contains("PERSONA=lusab-babad"));
@@ -1348,6 +1380,7 @@ mod tests {
             faculties: "/b/faculties",
             home: None,
             feed: false,
+            prompt_arg: None,
         });
         let script = dir.path().join("n.sh");
         std::fs::write(&script, script_text).unwrap();
@@ -1401,6 +1434,7 @@ mod tests {
             faculties: "/b/faculties",
             home: None,
             feed: false,
+            prompt_arg: None,
         });
         assert!(script.contains("exec codex exec - < /s/n.prompt\n"));
         assert!(!script.contains(". /"));

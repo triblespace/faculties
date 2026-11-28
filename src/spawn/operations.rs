@@ -1775,15 +1775,19 @@ impl Spawn {
         tint: Option<&WakeTint>,
         wish: CoverWish,
         assemble: &dyn Fn(&str) -> String,
-    ) -> Result<(String, Option<CoverRecord>)> {
+    ) -> Result<(String, String, Option<CoverRecord>)> {
         let wake = |memory_chars: usize| self.renderer.wake(&self.storage, tint, memory_chars);
         let Some(percent) = wish.percent else {
-            return Ok((assemble(&wake(PLAIN_MEMORY_CHARS)?), None));
+            let delivered = wake(PLAIN_MEMORY_CHARS)?;
+            let prompt = assemble(&delivered);
+            return Ok((delivered, prompt, None));
         };
         let window = match self.window(provider, model, wish.window) {
             Ok(window) => window,
             Err(why) => {
                 let delivered = wake(PLAIN_MEMORY_CHARS)?;
+                let cover_chars = delivered.chars().count();
+                let prompt = assemble(&delivered);
                 let summary = format!(
                     "cover {percent}%: no context window is known for {} {} ({why}), so it was \
                      rendered at the plain size, {PLAIN_MEMORY_CHARS} journal characters; \
@@ -1792,7 +1796,8 @@ impl Spawn {
                     model.unwrap_or("(no model named)")
                 );
                 return Ok((
-                    assemble(&delivered),
+                    delivered,
+                    prompt,
                     Some(CoverRecord {
                         percent,
                         window: None,
@@ -1801,7 +1806,7 @@ impl Spawn {
                         target_chars: None,
                         fixed_chars: None,
                         memory_budget: PLAIN_MEMORY_CHARS,
-                        cover_chars: delivered.chars().count(),
+                        cover_chars,
                         estimate: None,
                         headroom: None,
                         reduction: None,
@@ -1886,6 +1891,7 @@ impl Spawn {
             summary.push_str(reduction);
         }
         Ok((
+            delivered,
             prompt,
             Some(CoverRecord {
                 percent,
@@ -2068,13 +2074,19 @@ impl Spawn {
                 stdout_is_report: true,
             },
             Provider::Agy => {
-                // The prompt is stdin (`-p -`): a cover is longer than one
-                // argument may be. The result object is stdout; settlement
-                // reads the reply, usage and conversation id from it.
+                // Non-fed agy receives its first input as a `--print=<prompt>`
+                // argument constructed by `unit_script` from the prompt file
+                // (with `/dev/null` on stdin): agy takes `-p -` literally as
+                // `"-"`, and treats `-p "--help"` as a flag, while `--print=`
+                // delivers arbitrary text literally. Its wake is read by tools
+                // from part files so the first input stays small. The result
+                // object is stdout; settlement reads the reply, usage and
+                // conversation id from it.
                 // A fed resident reads user events from the feeder and
                 // writes events: its run spans many turns. Its prompt is the
-                // feeder's first event, so it has no `-p`: agy refuses one
-                // beside `--input-format stream-json` (exit 2).
+                // feeder's first event, so it has no `--print=` / `-p`: agy
+                // refuses a command-line prompt beside `--input-format
+                // stream-json` (exit 2).
                 let mut argv = vec![text(&self.launch.agy)];
                 if files.fed {
                     argv.extend(["--input-format".to_owned(), "stream-json".to_owned()]);
@@ -2094,9 +2106,6 @@ impl Spawn {
                 }
                 if let Some(conversation) = &files.agy_conversation {
                     argv.extend(["--conversation".to_owned(), conversation.clone()]);
-                }
-                if !files.fed {
-                    argv.extend(["-p".to_owned(), "-".to_owned()]);
                 }
                 AgentLine {
                     argv,
@@ -2789,13 +2798,20 @@ impl Spawn {
             };
             // A fed resident hears colony news between its turns.
             let fed = zooid.resident && provider == Provider::Agy;
-            // It also reads its wake by tools: agy cuts one user event, and
-            // a resident's whole wake is several times larger.
-            let wake_by_files = fed;
+            // Every agy run reads its wake by tools: agy cuts one user event
+            // and non-fed agy takes its prompt as one `--print=` argument
+            // (under Linux's per-arg limit), whereas a whole wake is several
+            // times larger.
+            let wake_by_files = provider == Provider::Agy;
             let preamble = if zooid.resident {
                 super::resident_preamble(&name, spawner_label, fed, wake_by_files)
             } else {
-                super::preamble(&name, spawner_label, provider == Provider::Local)
+                super::preamble(
+                    &name,
+                    spawner_label,
+                    provider == Provider::Local,
+                    wake_by_files,
+                )
             };
             let assemble = |wake: &str| super::assemble_prompt(wake, &preamble, &brief.text);
             // A local executor reads its own wake: its first input is the rest.
@@ -2803,14 +2819,12 @@ impl Spawn {
                 .then(|| super::assemble_brief(&preamble, &brief.text));
             // A resident wakes as a window does: the personal wake, untinted,
             // at its full size. A task zooid's cover is tinted by its brief.
-            let mut resident_wake = None;
-            let (prompt, cover) = if zooid.resident {
+            let (wake, prompt, cover) = if zooid.resident {
                 let wake = self
                     .renderer
                     .wake(&self.storage, None, crate::orient::WAKE_CHARS)?;
                 let prompt = assemble(&wake);
-                resident_wake = Some(wake);
-                (prompt, None)
+                (wake, prompt, None)
             } else {
                 self.size_cover(
                     provider,
@@ -2849,27 +2863,35 @@ impl Spawn {
             };
             // A fresh life that reads its wake by tools is first given who it
             // is, its brief and the wake's parts. The run records that first
-            // input as its prompt, exactly as it was fed, and the wake the
+            // input as its prompt, exactly as it was given, and the wake the
             // parts hold beside it.
             let wake_dir = launch.wake_dir(&name);
-            let (agent_input, wake_parts) = match &resident_wake {
-                Some(wake) if wake_by_files && agy_resume.conversation.is_none() => {
-                    let parts = super::wake_files::files(&wake_dir, wake);
+            let (agent_input, wake_parts) =
+                if wake_by_files && agy_resume.conversation.is_none() && !wake.is_empty() {
+                    let parts = super::wake_files::files(&wake_dir, &wake);
                     let reading = super::wake_files::reading(&parts, provider == Provider::Agy);
                     let input = super::wake_files::first_input(&preamble, &brief.text, &reading);
-                    if input.len() > super::wake_files::EVENT_BYTES {
-                        bail!(
-                            "{name}'s first input, who it is, the brief and how to read the \
-                             wake, is {} bytes, more than the {} one user event is given: \
-                             nothing was started. A shorter brief fits",
-                            input.len(),
-                            super::wake_files::EVENT_BYTES
-                        );
-                    }
                     (input, parts)
+                } else {
+                    (prompt.clone(), Vec::new())
+                };
+            if provider == Provider::Agy {
+                if agent_input.len() > super::wake_files::EVENT_BYTES {
+                    bail!(
+                        "{name}'s first input, who it is, the brief and how to read the \
+                         wake, is {} bytes, more than the {} one user event is given: \
+                         nothing was started. A shorter brief fits",
+                        agent_input.len(),
+                        super::wake_files::EVENT_BYTES
+                    );
                 }
-                _ => (prompt.clone(), Vec::new()),
-            };
+                if !fed && agent_input.contains('\0') {
+                    bail!(
+                        "{name}'s first input contains a NUL byte, which cannot be passed \
+                         as an agy --print argument: nothing was started"
+                    );
+                }
+            }
             let provider_reason = match provider {
                 Provider::Agy => format!("{provider_reason}; {}", agy_resume.reason),
                 _ => provider_reason.clone(),
@@ -2891,9 +2913,7 @@ impl Spawn {
                 workdir: workdir_text.clone(),
                 effort: effort.to_owned(),
                 prompt: agent_input.clone(),
-                wake: (!wake_parts.is_empty())
-                    .then(|| resident_wake.clone())
-                    .flatten(),
+                wake: (!wake_parts.is_empty()).then(|| wake.clone()),
                 provider: provider.name().to_owned(),
                 provider_reason: provider_reason.clone(),
                 model: model.clone(),
@@ -2988,6 +3008,7 @@ impl Spawn {
                     .then(|| text(&launch.real_home))
                     .as_deref(),
                 feed: fed,
+                prompt_arg: (provider == Provider::Agy && !fed).then_some("--print="),
             });
             std::fs::create_dir_all(&launch.state_dir)
                 .with_context(|| format!("create {}", launch.state_dir.display()))?;
@@ -6508,7 +6529,7 @@ mod tests {
         assert_eq!(
             text,
             super::super::assemble_brief(
-                &super::super::preamble(&launched.name, "agent-cc", true),
+                &super::super::preamble(&launched.name, "agent-cc", true, false),
                 &task
             )
         );
@@ -7124,7 +7145,7 @@ mod tests {
         let launched = f.spawn.run(&f.request(brief)).unwrap();
         let expected = super::super::assemble_prompt(
             &format!("STUB-WAKE about {brief}"),
-            &super::super::preamble(&launched.name, "agent-cc", false),
+            &super::super::preamble(&launched.name, "agent-cc", false, false),
             brief,
         );
         assert_eq!(prompt_of(&f, 0), expected);
@@ -9078,10 +9099,14 @@ mod tests {
         let settings = state.join(format!("{name}.settings.json"));
         assert!(
             script.contains(&format!(
-                "exec /fake/agy --output-format json --dangerously-skip-permissions \
-                 --disable-slash-commands --effort high --settings {} -p - < {} > {}\n",
-                settings.display(),
+                "exec 3< {} || exit 78\n\
+                 IFS= read -r -d '' _prompt <&3 || true\n\
+                 exec 3<&-\n\
+                 exec /fake/agy --output-format json --dangerously-skip-permissions \
+                 --disable-slash-commands --effort high --settings {} --print=\"$_prompt\" \
+                 < /dev/null > {}\n",
                 launched.report.with_extension("prompt").display(),
+                settings.display(),
                 launched.report.display()
             )),
             "{script}"
@@ -9147,7 +9172,10 @@ mod tests {
         assert_eq!(again.name, name);
         assert_eq!(again.agy_resume.conversation.as_deref(), Some("c-1"));
         let script = f.script(1);
-        assert!(script.contains("--conversation c-1 -p -"), "{script}");
+        assert!(
+            script.contains("--conversation c-1 --print=\"$_prompt\" < /dev/null"),
+            "{script}"
+        );
         let prompt = std::fs::read_to_string(launched.report.with_extension("prompt")).unwrap();
         assert!(
             prompt.contains("your own conversation c-1, continued"),
@@ -11694,5 +11722,203 @@ mod tests {
         );
         let (end, _) = feed_once(&f.spawn, "reading-test", launched.run, 1);
         assert_eq!(end, FeedEnd::Rounds);
+    }
+
+    /// A non-fed agy task zooid receives who it is, its brief and its wake part
+    /// paths verbatim via `--print="$_prompt"` with `/dev/null` on stdin, while
+    /// the wake parts on disk join byte-for-byte to the wake. A resumed run
+    /// delivers `agy_resume_prompt` the same way without rewriting wake parts.
+    #[test]
+    fn a_non_fed_agy_task_zooid_receives_its_brief_and_wake_parts_via_print_arg() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (renderer, _) = large_wake_renderer();
+        let brief = "Task brief with tricky text.\n--help\n'single' \"double\" $HOME\n\n";
+        let wake = format!(
+            "STUB-WAKE about {}{}",
+            super::super::about(brief),
+            renderer.fixed
+        );
+        assert!(wake.len() > 400_000, "{}", wake.len());
+        let f = fixture_full(
+            FakeLauncher::default(),
+            StubRenderer::default(),
+            "export TRIBLESPACE_PEERS=none\n",
+        );
+        let bin = f.directory.path().join("bin");
+        let agent = bin.join("task-agy");
+        let capture = f.directory.path().join("captured-print-arg.txt");
+        let capture_word = super::super::shell_word(&capture.display().to_string());
+        std::fs::write(
+            &agent,
+            format!(
+                "#!/bin/bash\n\
+                 got_print=0\n\
+                 print_val=\"\"\n\
+                 for a in \"$@\"; do\n\
+                   if [ \"$a\" = \"-p\" ]; then\n\
+                     echo 'unexpected -p flag' >&2\n\
+                     exit 3\n\
+                   fi\n\
+                   case \"$a\" in\n\
+                     --print=*)\n\
+                       got_print=1\n\
+                       print_val=\"${{a#--print=}}\"\n\
+                       ;;\n\
+                   esac\n\
+                 done\n\
+                 if [ \"$got_print\" -ne 1 ] || [ \"$print_val\" = \"-\" ] || [ -z \"$print_val\" ]; then\n\
+                   echo \"bad --print= arg: $print_val\" >&2\n\
+                   exit 4\n\
+                 fi\n\
+                 if IFS= read -r -n 1 _extra; then\n\
+                   echo \"expected /dev/null stdin\" >&2\n\
+                   exit 5\n\
+                 fi\n\
+                 printf '%s' \"$print_val\" > {capture_word}\n\
+                 echo '{{\"conversation_id\":\"c-task\",\"status\":\"SUCCESS\",\"response\":\"brief received\",\"usage\":{{}}}}'\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let spawn = f
+            .relaunch(|launch| {
+                launch.agy = agent.clone();
+            })
+            .with_renderer(Arc::new(renderer));
+
+        let mut request = f.request(brief);
+        request.provider = Provider::Agy;
+        let launched = spawn.run(&request).unwrap();
+        let prompt_path = launched.report.with_extension("prompt");
+        let first = std::fs::read_to_string(&prompt_path).unwrap();
+        assert!(first.len() <= super::super::wake_files::EVENT_BYTES);
+        assert!(!first.contains("WAKE-END-MARKER"));
+
+        let run_script = |script: &Path| {
+            let mut child = std::process::Command::new("/bin/bash")
+                .arg(script)
+                .current_dir(f.directory.path().join("lane"))
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(b"UNEXPECTED-STDIN\n")
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "script failed ({}): stdout={} stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+
+        let script0 = f.launcher.started.lock().unwrap()[0].script.clone();
+        run_script(&script0);
+
+        let captured = std::fs::read_to_string(&capture).unwrap();
+        assert_eq!(captured, first);
+        assert!(captured.contains("# Who you are"), "{captured}");
+        assert!(captured.contains("# Brief"), "{captured}");
+        assert!(captured.contains(brief.trim_end()), "{captured}");
+        assert!(
+            captured.contains("files named under # Wake below"),
+            "{captured}"
+        );
+        assert!(std::fs::read_to_string(&launched.report)
+            .unwrap()
+            .contains("brief received"));
+
+        let dir = f
+            .directory
+            .path()
+            .join("state")
+            .join(format!("{}.wake", launched.name));
+        let mut parts: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        parts.sort();
+        assert!(parts.len() > 10, "{parts:?}");
+        let mut joined = String::new();
+        for (index, part) in parts.iter().enumerate() {
+            let text = std::fs::read_to_string(part).unwrap();
+            assert!(
+                captured.contains(&part.display().to_string()),
+                "{}",
+                part.display()
+            );
+            if index > 0 {
+                let before = parts[index - 1].display().to_string();
+                assert!(captured.find(&before) < captured.find(&part.display().to_string()));
+            }
+            joined.push_str(&text);
+        }
+        assert_eq!(joined, wake);
+        let run0 = &spawn.show(&launched.name).unwrap().runs[0];
+        assert_eq!(run0.prompt, [super::super::text_handle(&first)]);
+        assert_eq!(run0.wake, [super::super::text_handle(&wake)]);
+
+        // Settle with room remaining so the next run resumes c-task.
+        let home = agy_home_of(&f, &launched.name);
+        agy_ran(&home, &launched.report, "c-task", &[40_000, 90_000]);
+        spawn
+            .settle(&SettleRequest {
+                name: launched.name.clone(),
+                run: launched.run,
+                exit: Exit::from_systemd("exited", "0", "success"),
+                report: Some(launched.report.clone()),
+                usage: None,
+            })
+            .unwrap();
+
+        let again = spawn.run(&request).unwrap();
+        assert_eq!(again.agy_resume.conversation.as_deref(), Some("c-task"));
+        let script1 = f.launcher.started.lock().unwrap()[1].script.clone();
+        run_script(&script1);
+        let resumed_expected =
+            std::fs::read_to_string(again.report.with_extension("prompt")).unwrap();
+        let resumed_captured = std::fs::read_to_string(&capture).unwrap();
+        assert_eq!(resumed_captured, resumed_expected);
+        assert!(
+            resumed_captured.contains("your own conversation c-task, continued"),
+            "{resumed_captured}"
+        );
+        assert!(!resumed_captured.contains("# Wake"), "{resumed_captured}");
+        let run1 = &spawn.show(&launched.name).unwrap().runs[1];
+        assert!(run1.wake.is_empty(), "{:?}", run1.wake);
+    }
+
+    /// A non-fed agy task whose first input exceeds one event or contains a NUL
+    /// byte is refused before launching anything.
+    #[test]
+    fn a_non_fed_agy_task_over_one_event_or_with_nul_is_not_started() {
+        let f = fixture();
+        let mut huge = f.request(&format!("Agy task. {}", "x".repeat(130_000)));
+        huge.provider = Provider::Agy;
+        let error = f.spawn.run(&huge).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("nothing was started"),
+            "{error:#}"
+        );
+        assert!(f.launcher.started.lock().unwrap().is_empty());
+
+        let mut with_nul = f.request("Agy task with \0 NUL.");
+        with_nul.provider = Provider::Agy;
+        let error = f.spawn.run(&with_nul).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("NUL byte") && text.contains("nothing was started"),
+            "{text}"
+        );
+        assert!(f.launcher.started.lock().unwrap().is_empty());
     }
 }
